@@ -1,96 +1,338 @@
-import pandas as pd
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
 
-
-def clean_column_names(df):
-    """
-    Clean Excel column names by removing extra spaces
-    and converting them to lowercase with underscores.
-    """
-    df.columns = (
-        df.columns
-        .str.strip()
-        .str.lower()
-        .str.replace(" ", "_")
-    )
-    return df
+import pandas as pd
+from openpyxl import load_workbook
 
 
-def main():
-    # Input and output file paths
-    input_file = Path("sample_data.xlsx")
-    output_file = Path("output_summary.xlsx")
+class ExcelDataTransferApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Excel Data Transfer Tool")
+        self.root.geometry("700x450")
 
-    # Read Excel file
-    df = pd.read_excel(input_file)
+        self.source_file = None
+        self.target_file = None
 
-    # Clean column names
-    df = clean_column_names(df)
+        self.create_widgets()
 
-    # Example expected columns:
-    # state, county_name, specialty_group_name, membership_count, met_overall
-
-    required_columns = [
-        "state",
-        "county_name",
-        "specialty_group_name",
-        "membership_count",
-        "met_overall"
-    ]
-
-    # Check missing columns
-    missing_columns = [col for col in required_columns if col not in df.columns]
-
-    if missing_columns:
-        print("Missing required columns:")
-        for col in missing_columns:
-            print(f"- {col}")
-        return
-
-    # Filter only rows where Met Overall = Y
-    met_df = df[df["met_overall"].astype(str).str.upper() == "Y"]
-
-    # Create summary by State and Specialty
-    summary = (
-        df.groupby(["state", "specialty_group_name"])
-        .agg(
-            total_membership=("membership_count", "sum"),
-            total_county_rows=("county_name", "count")
+    def create_widgets(self):
+        title_label = tk.Label(
+            self.root,
+            text="Excel Data Transfer Tool",
+            font=("Arial", 18, "bold")
         )
-        .reset_index()
-    )
+        title_label.pack(pady=15)
 
-    # Create met summary
-    met_summary = (
-        met_df.groupby(["state", "specialty_group_name"])
-        .agg(
-            met_county_rows=("county_name", "count")
+        # Source file selection
+        source_frame = tk.Frame(self.root)
+        source_frame.pack(fill="x", padx=20, pady=5)
+
+        tk.Label(
+            source_frame,
+            text="Source File:",
+            width=16,
+            anchor="w"
+        ).pack(side="left")
+
+        self.source_label = tk.Label(
+            source_frame,
+            text="No file selected",
+            fg="gray",
+            anchor="w"
         )
-        .reset_index()
-    )
+        self.source_label.pack(side="left", fill="x", expand=True)
 
-    # Merge summary together
-    final_summary = summary.merge(
-        met_summary,
-        on=["state", "specialty_group_name"],
-        how="left"
-    )
+        tk.Button(
+            source_frame,
+            text="Browse",
+            command=self.select_source_file
+        ).pack(side="right")
 
-    # Fill blank met rows with 0
-    final_summary["met_county_rows"] = final_summary["met_county_rows"].fillna(0)
+        # Source sheet selection
+        source_sheet_frame = tk.Frame(self.root)
+        source_sheet_frame.pack(fill="x", padx=20, pady=5)
 
-    # Calculate adequacy rate
-    final_summary["adequacy_rate"] = (
-        final_summary["met_county_rows"] / final_summary["total_county_rows"]
-    )
+        tk.Label(
+            source_sheet_frame,
+            text="Source Sheet:",
+            width=16,
+            anchor="w"
+        ).pack(side="left")
 
-    # Export to Excel
-    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="Cleaned Data", index=False)
-        final_summary.to_excel(writer, sheet_name="Summary", index=False)
+        self.source_sheet_combo = ttk.Combobox(
+            source_sheet_frame,
+            state="readonly"
+        )
+        self.source_sheet_combo.pack(side="left", fill="x", expand=True)
 
-    print(f"Automation completed. File saved as: {output_file}")
+        # Target file selection
+        target_frame = tk.Frame(self.root)
+        target_frame.pack(fill="x", padx=20, pady=5)
+
+        tk.Label(
+            target_frame,
+            text="Target File:",
+            width=16,
+            anchor="w"
+        ).pack(side="left")
+
+        self.target_label = tk.Label(
+            target_frame,
+            text="No file selected",
+            fg="gray",
+            anchor="w"
+        )
+        self.target_label.pack(side="left", fill="x", expand=True)
+
+        tk.Button(
+            target_frame,
+            text="Browse",
+            command=self.select_target_file
+        ).pack(side="right")
+
+        # Target sheet selection
+        target_sheet_frame = tk.Frame(self.root)
+        target_sheet_frame.pack(fill="x", padx=20, pady=5)
+
+        tk.Label(
+            target_sheet_frame,
+            text="Target Sheet:",
+            width=16,
+            anchor="w"
+        ).pack(side="left")
+
+        self.target_sheet_combo = ttk.Combobox(
+            target_sheet_frame,
+            state="readonly"
+        )
+        self.target_sheet_combo.pack(side="left", fill="x", expand=True)
+
+        # Transfer mode
+        mode_frame = tk.Frame(self.root)
+        mode_frame.pack(fill="x", padx=20, pady=10)
+
+        tk.Label(
+            mode_frame,
+            text="Transfer Mode:",
+            width=16,
+            anchor="w"
+        ).pack(side="left")
+
+        self.transfer_mode = tk.StringVar(value="append")
+
+        mode_options_frame = tk.Frame(mode_frame)
+        mode_options_frame.pack(side="left", fill="x", expand=True)
+
+        tk.Radiobutton(
+            mode_options_frame,
+            text="Append source data to the target sheet",
+            variable=self.transfer_mode,
+            value="append"
+        ).pack(anchor="w")
+
+        tk.Radiobutton(
+            mode_options_frame,
+            text="Replace target sheet with source data",
+            variable=self.transfer_mode,
+            value="replace"
+        ).pack(anchor="w")
+
+        # Transfer button
+        tk.Button(
+            self.root,
+            text="Transfer Data",
+            command=self.transfer_data,
+            font=("Arial", 12, "bold"),
+            bg="#2E7D32",
+            fg="white",
+            height=2
+        ).pack(fill="x", padx=20, pady=15)
+
+        # Status box
+        tk.Label(
+            self.root,
+            text="Status Log:",
+            anchor="w"
+        ).pack(fill="x", padx=20)
+
+        self.status_text = tk.Text(self.root, height=7)
+        self.status_text.pack(fill="both", expand=True, padx=20, pady=5)
+
+    def log_message(self, message):
+        self.status_text.insert(tk.END, message + "\n")
+        self.status_text.see(tk.END)
+
+    def select_source_file(self):
+        file_path = filedialog.askopenfilename(
+            title="Select Source Excel File",
+            filetypes=[("Excel Files", "*.xlsx *.xls")]
+        )
+
+        if file_path:
+            self.source_file = Path(file_path)
+            self.source_label.config(text=self.source_file.name, fg="black")
+            self.load_source_sheets()
+
+    def select_target_file(self):
+        file_path = filedialog.askopenfilename(
+            title="Select Target Excel File",
+            filetypes=[("Excel Files", "*.xlsx")]
+        )
+
+        if file_path:
+            self.target_file = Path(file_path)
+            self.target_label.config(text=self.target_file.name, fg="black")
+            self.load_target_sheets()
+
+    def load_source_sheets(self):
+        try:
+            excel_file = pd.ExcelFile(self.source_file)
+            sheet_names = excel_file.sheet_names
+
+            self.source_sheet_combo["values"] = sheet_names
+
+            if sheet_names:
+                self.source_sheet_combo.current(0)
+
+            self.log_message(f"Source file loaded: {self.source_file.name}")
+
+        except Exception as error:
+            messagebox.showerror(
+                "Error",
+                f"Could not load source file:\n{error}"
+            )
+
+    def load_target_sheets(self):
+        try:
+            excel_file = pd.ExcelFile(self.target_file)
+            sheet_names = excel_file.sheet_names
+
+            self.target_sheet_combo["values"] = sheet_names
+
+            if sheet_names:
+                self.target_sheet_combo.current(0)
+
+            self.log_message(f"Target file loaded: {self.target_file.name}")
+
+        except Exception as error:
+            messagebox.showerror(
+                "Error",
+                f"Could not load target file:\n{error}"
+            )
+
+    def transfer_data(self):
+        if not self.source_file:
+            messagebox.showwarning(
+                "Missing Source File",
+                "Please select a source Excel file."
+            )
+            return
+
+        if not self.target_file:
+            messagebox.showwarning(
+                "Missing Target File",
+                "Please select a target Excel file."
+            )
+            return
+
+        source_sheet = self.source_sheet_combo.get()
+        target_sheet = self.target_sheet_combo.get()
+
+        if not source_sheet:
+            messagebox.showwarning(
+                "Missing Source Sheet",
+                "Please select a source sheet."
+            )
+            return
+
+        if not target_sheet:
+            messagebox.showwarning(
+                "Missing Target Sheet",
+                "Please select a target sheet."
+            )
+            return
+
+        try:
+            self.log_message("Reading source data...")
+
+            source_df = pd.read_excel(
+                self.source_file,
+                sheet_name=source_sheet
+            )
+
+            if source_df.empty:
+                messagebox.showwarning(
+                    "No Data",
+                    "The selected source sheet does not contain any data."
+                )
+                return
+
+            selected_mode = self.transfer_mode.get()
+
+            if selected_mode == "append":
+                self.append_data_to_target(source_df, target_sheet)
+            elif selected_mode == "replace":
+                self.replace_target_sheet(source_df, target_sheet)
+
+            self.log_message("Data transfer completed successfully.")
+            messagebox.showinfo(
+                "Success",
+                "Data transfer completed successfully."
+            )
+
+        except Exception as error:
+            self.log_message(f"Error: {error}")
+            messagebox.showerror(
+                "Error",
+                f"Data transfer failed:\n{error}"
+            )
+
+    def append_data_to_target(self, source_df, target_sheet):
+        self.log_message("Appending data to the target sheet...")
+
+        workbook = load_workbook(self.target_file)
+
+        if target_sheet not in workbook.sheetnames:
+            messagebox.showerror(
+                "Error",
+                f"Target sheet '{target_sheet}' does not exist."
+            )
+            return
+
+        worksheet = workbook[target_sheet]
+
+        for row in source_df.itertuples(index=False):
+            worksheet.append(row)
+
+        workbook.save(self.target_file)
+
+        self.log_message(
+            f"Appended {len(source_df)} rows to '{target_sheet}'."
+        )
+
+    def replace_target_sheet(self, source_df, target_sheet):
+        self.log_message("Replacing target sheet data...")
+
+        with pd.ExcelWriter(
+            self.target_file,
+            engine="openpyxl",
+            mode="a",
+            if_sheet_exists="replace"
+        ) as writer:
+            source_df.to_excel(
+                writer,
+                sheet_name=target_sheet,
+                index=False
+            )
+
+        self.log_message(
+            f"Replaced '{target_sheet}' with {len(source_df)} rows."
+        )
 
 
 if __name__ == "__main__":
-    main()
+    root = tk.Tk()
+    app = ExcelDataTransferApp(root)
+    root.mainloop()
