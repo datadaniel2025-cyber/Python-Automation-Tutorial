@@ -1,0 +1,38 @@
+"""
+Lesson 09 - Merge Multiple Excel Files
+
+This lesson teaches how to:
+1. Read multiple Excel files from a folder
+2. Combine them into one dataset
+3. Export the combined result
+"""
+
+import pandas as pd
+from pathlib import Path
+
+
+input_folder = Path("input_files")
+output_file = Path("merged_output.xlsx")
+
+excel_files = list(input_folder.glob("*.xlsx"))
+
+if not excel_files:
+    print("No Excel files found in the input_files folder.")
+else:
+    all_data = []
+
+    for file in excel_files:
+        print(f"Reading: {file.name}")
+
+        df = pd.read_excel(file)
+
+        df["source_file"] = file.name
+
+        all_data.append(df)
+
+    combined_df = pd.concat(all_data, ignore_index=True)
+
+    combined_df.to_excel(output_file, index=False)
+
+    print("Merge completed.")
+    print(f"Output created: {output_file}")
