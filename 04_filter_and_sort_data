@@ -1,0 +1,41 @@
+"""
+Lesson 04 - Filter and Sort Data
+
+This lesson teaches how to:
+1. Filter rows
+2. Sort data
+3. Export filtered results
+"""
+
+import pandas as pd
+from pathlib import Path
+
+
+input_file = Path("sample_orders.xlsx")
+output_file = Path("filtered_orders.xlsx")
+
+if not input_file.exists():
+    print("Error: sample_orders.xlsx was not found.")
+else:
+    df = pd.read_excel(input_file)
+
+    df.columns = (
+        df.columns
+        .str.strip()
+        .str.lower()
+        .str.replace(" ", "_")
+    )
+
+    # Keep only rows where quantity is greater than or equal to 2
+    filtered_df = df[df["quantity"] >= 2]
+
+    # Sort by unit price from high to low
+    filtered_df = filtered_df.sort_values(
+        by="unit_price",
+        ascending=False
+    )
+
+    filtered_df.to_excel(output_file, index=False)
+
+    print("Filtering and sorting completed.")
+    print(f"Output created: {output_file}")
