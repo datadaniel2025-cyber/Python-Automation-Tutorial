@@ -1,0 +1,57 @@
+"""
+Lesson 05 - Create Summary Report
+
+This lesson teaches how to:
+1. Create calculated columns
+2. Group data
+3. Create summary tables
+4. Export multiple sheets to Excel
+"""
+
+import pandas as pd
+from pathlib import Path
+
+
+input_file = Path("sample_orders.xlsx")
+output_file = Path("summary_report.xlsx")
+
+if not input_file.exists():
+    print("Error: sample_orders.xlsx was not found.")
+else:
+    df = pd.read_excel(input_file)
+
+    df.columns = (
+        df.columns
+        .str.strip()
+        .str.lower()
+        .str.replace(" ", "_")
+    )
+
+    df["total_amount"] = df["quantity"] * df["unit_price"]
+
+    category_summary = (
+        df.groupby("category")
+        .agg(
+            total_orders=("order_id", "count"),
+            total_quantity=("quantity", "sum"),
+            total_amount=("total_amount", "sum")
+        )
+        .reset_index()
+    )
+
+    customer_summary = (
+        df.groupby("customer")
+        .agg(
+            total_orders=("order_id", "count"),
+            total_amount=("total_amount", "sum")
+        )
+        .reset_index()
+    )
+
+    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="Cleaned Data", index=False)
+        category_summary.to_excel(writer, sheet_name="Category Summary", index=False)
+        customer_summary.to_excel(writer, sheet_name="Customer Summary", index=False)
+
+    print("Summary report created.")
+    print(f"Output created: {output_file}")
