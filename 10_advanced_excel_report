@@ -1,0 +1,74 @@
+"""
+Lesson 10 - Advanced Excel Report
+
+This lesson teaches how to:
+1. Create an Excel report
+2. Format header rows
+3. Adjust column widths
+4. Add number formatting
+"""
+
+import pandas as pd
+from pathlib import Path
+from openpyxl import load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+
+
+input_file = Path("sample_orders.xlsx")
+output_file = Path("formatted_summary_report.xlsx")
+
+if not input_file.exists():
+    print("Error: sample_orders.xlsx was not found.")
+else:
+    df = pd.read_excel(input_file)
+
+    df.columns = (
+        df.columns
+        .str.strip()
+        .str.lower()
+        .str.replace(" ", "_")
+    )
+
+    df["total_amount"] = df["quantity"] * df["unit_price"]
+
+    summary = (
+        df.groupby("category")
+        .agg(
+            total_quantity=("quantity", "sum"),
+            total_amount=("total_amount", "sum")
+        )
+        .reset_index()
+    )
+
+    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="Cleaned Data", index=False)
+        summary.to_excel(writer, sheet_name="Summary", index=False)
+
+    workbook = load_workbook(output_file)
+
+    for sheet_name in workbook.sheetnames:
+        worksheet = workbook[sheet_name]
+
+        for cell in worksheet[1]:
+            cell.font = Font(bold=True)
+            cell.fill = PatternFill(
+                start_color="D9EAF7",
+                end_color="D9EAF7",
+                fill_type="solid"
+            )
+            cell.alignment = Alignment(horizontal="center")
+
+        for column_cells in worksheet.columns:
+            max_length = 0
+            column_letter = column_cells[0].column_letter
+
+            for cell in column_cells:
+                if cell.value is not None:
+                    max_length = max(max_length, len(str(cell.value)))
+
+            worksheet.column_dimensions[column_letter].width = max_length + 2
+
+    workbook.save(output_file)
+
+    print("Formatted Excel report created.")
+    print(f"Output created: {output_file}")
