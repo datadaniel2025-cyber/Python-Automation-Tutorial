@@ -1,0 +1,152 @@
+"""
+Excel Data Visualization Tutorial
+
+This script teaches how to:
+1. Read an Excel file
+2. Clean column names
+3. Calculate total sales
+4. Create a summary table
+5. Create simple charts with matplotlib
+6. Export the summary to Excel
+
+Required packages:
+pip install pandas openpyxl matplotlib
+"""
+
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+
+def clean_column_names(df):
+    """
+    Clean column names so they are easier to use in Python.
+
+    Example:
+    "Unit Price" becomes "unit_price"
+    """
+    df.columns = (
+        df.columns
+        .str.strip()
+        .str.lower()
+        .str.replace(" ", "_")
+    )
+    return df
+
+
+def main():
+    # Step 1: Set file names
+    input_file = Path("sample_sales_data.xlsx")
+    output_file = Path("sales_visualization_summary.xlsx")
+
+    # Step 2: Check if input file exists
+    if not input_file.exists():
+        print(f"Error: Cannot find {input_file}")
+        print("Please create an Excel file named sample_sales_data.xlsx first.")
+        return
+
+    # Step 3: Read Excel file
+    df = pd.read_excel(input_file)
+
+    # Step 4: Clean column names
+    df = clean_column_names(df)
+
+    # Step 5: Check required columns
+    required_columns = [
+        "date",
+        "product",
+        "category",
+        "quantity",
+        "unit_price"
+    ]
+
+    missing_columns = [
+        column for column in required_columns
+        if column not in df.columns
+    ]
+
+    if missing_columns:
+        print("Error: Missing required columns:")
+        for column in missing_columns:
+            print(f"- {column}")
+        return
+
+    # Step 6: Create calculated column
+    df["total_sales"] = df["quantity"] * df["unit_price"]
+
+    # Step 7: Create summary by category
+    category_summary = (
+        df.groupby("category")
+        .agg(
+            total_quantity=("quantity", "sum"),
+            total_sales=("total_sales", "sum")
+        )
+        .reset_index()
+    )
+
+    # Step 8: Create summary by product
+    product_summary = (
+        df.groupby("product")
+        .agg(
+            total_quantity=("quantity", "sum"),
+            total_sales=("total_sales", "sum")
+        )
+        .reset_index()
+        .sort_values(by="total_sales", ascending=False)
+    )
+
+    # Step 9: Export summary to Excel
+    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="Cleaned Data", index=False)
+        category_summary.to_excel(writer, sheet_name="Category Summary", index=False)
+        product_summary.to_excel(writer, sheet_name="Product Summary", index=False)
+
+    # Step 10: Create bar chart by category
+    plt.figure(figsize=(8, 5))
+    plt.bar(category_summary["category"], category_summary["total_sales"])
+    plt.title("Total Sales by Category")
+    plt.xlabel("Category")
+    plt.ylabel("Total Sales")
+    plt.xticks(rotation=30)
+    plt.tight_layout()
+    plt.savefig("total_sales_by_category.png")
+    plt.close()
+
+    # Step 11: Create bar chart by product
+    plt.figure(figsize=(8, 5))
+    plt.bar(product_summary["product"], product_summary["total_sales"])
+    plt.title("Total Sales by Product")
+    plt.xlabel("Product")
+    plt.ylabel("Total Sales")
+    plt.xticks(rotation=30)
+    plt.tight_layout()
+    plt.savefig("total_sales_by_product.png")
+    plt.close()
+
+    # Step 12: Create line chart by date
+    daily_summary = (
+        df.groupby("date")
+        .agg(total_sales=("total_sales", "sum"))
+        .reset_index()
+    )
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(daily_summary["date"], daily_summary["total_sales"], marker="o")
+    plt.title("Total Sales by Date")
+    plt.xlabel("Date")
+    plt.ylabel("Total Sales")
+    plt.xticks(rotation=30)
+    plt.tight_layout()
+    plt.savefig("total_sales_by_date.png")
+    plt.close()
+
+    print("Data visualization completed successfully.")
+    print(f"Excel summary created: {output_file}")
+    print("Charts created:")
+    print("- total_sales_by_category.png")
+    print("- total_sales_by_product.png")
+    print("- total_sales_by_date.png")
+
+
+if __name__ == "__main__":
+    main()
