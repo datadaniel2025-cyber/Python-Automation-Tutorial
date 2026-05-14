@@ -1,0 +1,99 @@
+"""
+Excel Summary Report Tutorial
+
+This simple Python script teaches how to:
+1. Read an Excel file
+2. Check required columns
+3. Clean column names
+4. Create a new calculated column
+5. Build a summary table
+6. Export results to a new Excel file
+
+Required packages:
+pip install pandas openpyxl
+"""
+
+import pandas as pd
+from pathlib import Path
+
+
+def clean_column_names(df):
+    """
+    Clean column names so they are easier to use in Python.
+
+    Example:
+    "Unit Price" becomes "unit_price"
+    " Product Name " becomes "product_name"
+    """
+    df.columns = (
+        df.columns
+        .str.strip()
+        .str.lower()
+        .str.replace(" ", "_")
+    )
+    return df
+
+
+def main():
+    # Step 1: Set input and output file names
+    input_file = Path("sample_orders.xlsx")
+    output_file = Path("order_summary_report.xlsx")
+
+    # Step 2: Check if the input file exists
+    if not input_file.exists():
+        print(f"Error: Cannot find {input_file}")
+        print("Please create an Excel file named sample_orders.xlsx first.")
+        return
+
+    # Step 3: Read the Excel file
+    df = pd.read_excel(input_file)
+
+    # Step 4: Clean column names
+    df = clean_column_names(df)
+
+    # Step 5: Check required columns
+    required_columns = [
+        "order_id",
+        "customer",
+        "category",
+        "quantity",
+        "unit_price"
+    ]
+
+    missing_columns = [
+        column for column in required_columns
+        if column not in df.columns
+    ]
+
+    if missing_columns:
+        print("Error: Missing required columns:")
+        for column in missing_columns:
+            print(f"- {column}")
+        return
+
+    # Step 6: Create a calculated column
+    df["total_amount"] = df["quantity"] * df["unit_price"]
+
+    # Step 7: Create a summary by category
+    summary = (
+        df.groupby("category")
+        .agg(
+            total_orders=("order_id", "count"),
+            total_quantity=("quantity", "sum"),
+            total_amount=("total_amount", "sum"),
+            average_price=("unit_price", "mean")
+        )
+        .reset_index()
+    )
+
+    # Step 8: Export cleaned data and summary to Excel
+    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="Cleaned Data", index=False)
+        summary.to_excel(writer, sheet_name="Summary", index=False)
+
+    print("Excel automation completed successfully.")
+    print(f"Output file created: {output_file}")
+
+
+if __name__ == "__main__":
+    main()
