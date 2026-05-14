@@ -1,0 +1,47 @@
+"""
+Lesson 01 - Python Basics
+
+This lesson teaches:
+1. Variables
+2. Lists
+3. Dictionaries
+4. Loops
+5. Functions
+"""
+
+# Variable
+name = "Python Student"
+age = 30
+
+print("Name:", name)
+print("Age:", age)
+
+# List
+products = ["Keyboard", "Mouse", "Monitor", "Desk"]
+
+print("\nProduct List:")
+for product in products:
+    print("-", product)
+
+# Dictionary
+order = {
+    "order_id": 1001,
+    "customer": "John",
+    "amount": 250
+}
+
+print("\nOrder Information:")
+print("Order ID:", order["order_id"])
+print("Customer:", order["customer"])
+print("Amount:", order["amount"])
+
+
+# Function
+def calculate_total(quantity, unit_price):
+    total = quantity * unit_price
+    return total
+
+
+result = calculate_total(3, 25)
+
+print("\nCalculated Total:", result)
