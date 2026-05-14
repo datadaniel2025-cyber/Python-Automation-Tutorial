@@ -1,0 +1,224 @@
+"""
+Project: Excel Sales Report Automation
+
+This project teaches how to automate an Excel reporting workflow using Python.
+
+The script will:
+1. Read a sales Excel file
+2. Clean column names
+3. Validate required columns
+4. Calculate total sales
+5. Create summary tables
+6. Export a formatted Excel report
+7. Create simple chart images
+
+Required packages:
+pip install pandas openpyxl matplotlib
+"""
+
+from pathlib import Path
+
+import pandas as pd
+import matplotlib.pyplot as plt
+from openpyxl import load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+
+
+def clean_column_names(df):
+    """
+    Clean column names so they are easier to use in Python.
+
+    Example:
+    "Unit Price" becomes "unit_price"
+    """
+    df.columns = (
+        df.columns
+        .str.strip()
+        .str.lower()
+        .str.replace(" ", "_")
+    )
+    return df
+
+
+def validate_columns(df, required_columns):
+    """
+    Check if all required columns exist in the dataset.
+    """
+    missing_columns = [
+        column for column in required_columns
+        if column not in df.columns
+    ]
+
+    if missing_columns:
+        print("Error: Missing required columns:")
+        for column in missing_columns:
+            print(f"- {column}")
+        return False
+
+    return True
+
+
+def create_charts(category_summary, monthly_summary):
+    """
+    Create chart images from summary tables.
+    """
+
+    # Bar chart: total sales by category
+    plt.figure(figsize=(8, 5))
+    plt.bar(category_summary["category"], category_summary["total_sales"])
+    plt.title("Total Sales by Category")
+    plt.xlabel("Category")
+    plt.ylabel("Total Sales")
+    plt.xticks(rotation=30)
+    plt.tight_layout()
+    plt.savefig("total_sales_by_category.png")
+    plt.close()
+
+    # Line chart: total sales by month
+    plt.figure(figsize=(8, 5))
+    plt.plot(
+        monthly_summary["month"].astype(str),
+        monthly_summary["total_sales"],
+        marker="o"
+    )
+    plt.title("Total Sales by Month")
+    plt.xlabel("Month")
+    plt.ylabel("Total Sales")
+    plt.xticks(rotation=30)
+    plt.tight_layout()
+    plt.savefig("total_sales_by_month.png")
+    plt.close()
+
+
+def format_excel_report(output_file):
+    """
+    Format the exported Excel report.
+    """
+
+    workbook = load_workbook(output_file)
+
+    header_fill = PatternFill(
+        start_color="D9EAF7",
+        end_color="D9EAF7",
+        fill_type="solid"
+    )
+
+    for sheet_name in workbook.sheetnames:
+        worksheet = workbook[sheet_name]
+
+        # Format header row
+        for cell in worksheet[1]:
+            cell.font = Font(bold=True)
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center")
+
+        # Auto-adjust column width
+        for column_cells in worksheet.columns:
+            max_length = 0
+            column_letter = column_cells[0].column_letter
+
+            for cell in column_cells:
+                if cell.value is not None:
+                    max_length = max(max_length, len(str(cell.value)))
+
+            worksheet.column_dimensions[column_letter].width = max_length + 2
+
+    workbook.save(output_file)
+
+
+def main():
+    input_file = Path("sample_sales_data.xlsx")
+    output_file = Path("sales_report_output.xlsx")
+
+    required_columns = [
+        "date",
+        "order_id",
+        "customer",
+        "category",
+        "product",
+        "quantity",
+        "unit_price"
+    ]
+
+    # Step 1: Check input file
+    if not input_file.exists():
+        print(f"Error: Cannot find {input_file}")
+        print("Please create sample_sales_data.xlsx first.")
+        return
+
+    # Step 2: Read Excel file
+    df = pd.read_excel(input_file)
+
+    # Step 3: Clean column names
+    df = clean_column_names(df)
+
+    # Step 4: Validate required columns
+    if not validate_columns(df, required_columns):
+        return
+
+    # Step 5: Convert date column
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+
+    # Step 6: Create calculated columns
+    df["total_sales"] = df["quantity"] * df["unit_price"]
+    df["month"] = df["date"].dt.to_period("M")
+
+    # Step 7: Create summary by category
+    category_summary = (
+        df.groupby("category")
+        .agg(
+            total_orders=("order_id", "count"),
+            total_quantity=("quantity", "sum"),
+            total_sales=("total_sales", "sum"),
+            average_unit_price=("unit_price", "mean")
+        )
+        .reset_index()
+        .sort_values(by="total_sales", ascending=False)
+    )
+
+    # Step 8: Create summary by customer
+    customer_summary = (
+        df.groupby("customer")
+        .agg(
+            total_orders=("order_id", "count"),
+            total_sales=("total_sales", "sum")
+        )
+        .reset_index()
+        .sort_values(by="total_sales", ascending=False)
+    )
+
+    # Step 9: Create monthly summary
+    monthly_summary = (
+        df.groupby("month")
+        .agg(
+            total_orders=("order_id", "count"),
+            total_sales=("total_sales", "sum")
+        )
+        .reset_index()
+    )
+
+    # Convert month to text before exporting
+    monthly_summary["month"] = monthly_summary["month"].astype(str)
+
+    # Step 10: Export report to Excel
+    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="Cleaned Data", index=False)
+        category_summary.to_excel(writer, sheet_name="Category Summary", index=False)
+        customer_summary.to_excel(writer, sheet_name="Customer Summary", index=False)
+        monthly_summary.to_excel(writer, sheet_name="Monthly Summary", index=False)
+
+    # Step 11: Format Excel report
+    format_excel_report(output_file)
+
+    # Step 12: Create charts
+    create_charts(category_summary, monthly_summary)
+
+    print("Project completed successfully.")
+    print(f"Excel report created: {output_file}")
+    print("Charts created:")
+    print("- total_sales_by_category.png")
+    print("- total_sales_by_month.png")
+
+
+if __name__ == "__main__":
+    main()
