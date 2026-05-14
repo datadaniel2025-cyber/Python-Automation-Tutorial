@@ -1,0 +1,49 @@
+"""
+Lesson 03 - Clean Excel Data
+
+This lesson teaches how to:
+1. Clean column names
+2. Remove blank rows
+3. Fill missing values
+4. Remove duplicate rows
+"""
+
+import pandas as pd
+from pathlib import Path
+
+
+def clean_column_names(df):
+    df.columns = (
+        df.columns
+        .str.strip()
+        .str.lower()
+        .str.replace(" ", "_")
+    )
+    return df
+
+
+input_file = Path("sample_orders.xlsx")
+output_file = Path("cleaned_orders.xlsx")
+
+if not input_file.exists():
+    print("Error: sample_orders.xlsx was not found.")
+else:
+    df = pd.read_excel(input_file)
+
+    df = clean_column_names(df)
+
+    df = df.dropna(how="all")
+
+    df = df.fillna({
+        "customer": "Unknown",
+        "category": "Unknown",
+        "quantity": 0,
+        "unit_price": 0
+    })
+
+    df = df.drop_duplicates()
+
+    df.to_excel(output_file, index=False)
+
+    print("Data cleaning completed.")
+    print(f"Output created: {output_file}")
