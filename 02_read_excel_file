@@ -1,0 +1,28 @@
+"""
+Lesson 02 - Read Excel File
+
+This lesson teaches how to:
+1. Read an Excel file
+2. Display the first few rows
+3. View column names
+"""
+
+import pandas as pd
+from pathlib import Path
+
+
+input_file = Path("sample_orders.xlsx")
+
+if not input_file.exists():
+    print("Error: sample_orders.xlsx was not found.")
+else:
+    df = pd.read_excel(input_file)
+
+    print("First 5 rows:")
+    print(df.head())
+
+    print("\nColumn names:")
+    print(df.columns.tolist())
+
+    print("\nNumber of rows and columns:")
+    print(df.shape)
