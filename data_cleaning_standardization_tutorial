@@ -1,0 +1,166 @@
+"""
+Data Cleaning and Standardization Tutorial
+
+This script teaches how to:
+1. Read an Excel file
+2. Clean column names
+3. Remove blank rows
+4. Standardize text values
+5. Clean phone numbers
+6. Clean ZIP codes
+7. Convert dates
+8. Remove duplicate records
+9. Export cleaned data to Excel
+
+Required packages:
+pip install pandas openpyxl
+"""
+
+from pathlib import Path
+import pandas as pd
+
+
+def clean_column_names(df):
+    """
+    Standardize column names.
+
+    Example:
+    " Customer Name " becomes "customer_name"
+    "Order Date" becomes "order_date"
+    """
+    df.columns = (
+        df.columns
+        .str.strip()
+        .str.lower()
+        .str.replace(" ", "_")
+        .str.replace("-", "_")
+    )
+    return df
+
+
+def clean_text(value):
+    """
+    Standardize text values:
+    - Convert to string
+    - Remove extra spaces
+    - Convert to title case
+    """
+    if pd.isna(value):
+        return ""
+
+    return str(value).strip().title()
+
+
+def clean_phone_number(value):
+    """
+    Clean phone number by keeping digits only.
+
+    Example:
+    "(215) 555-1234" becomes "2155551234"
+    """
+    if pd.isna(value):
+        return ""
+
+    digits_only = "".join(char for char in str(value) if char.isdigit())
+    return digits_only
+
+
+def clean_zip_code(value):
+    """
+    Clean ZIP code and keep first 5 digits.
+
+    Example:
+    "19462-1234" becomes "19462"
+    """
+    if pd.isna(value):
+        return ""
+
+    digits_only = "".join(char for char in str(value) if char.isdigit())
+    return digits_only[:5]
+
+
+def main():
+    input_file = Path("messy_customer_data.xlsx")
+    output_file = Path("cleaned_customer_data.xlsx")
+
+    if not input_file.exists():
+        print(f"Error: Cannot find {input_file}")
+        print("Please create an Excel file named messy_customer_data.xlsx first.")
+        return
+
+    # Step 1: Read Excel file
+    df = pd.read_excel(input_file)
+
+    # Step 2: Clean column names
+    df = clean_column_names(df)
+
+    # Step 3: Remove rows where every column is blank
+    df = df.dropna(how="all")
+
+    # Step 4: Check required columns
+    required_columns = [
+        "customer_id",
+        "customer_name",
+        "city",
+        "state",
+        "phone",
+        "zip_code",
+        "order_date"
+    ]
+
+    missing_columns = [
+        column for column in required_columns
+        if column not in df.columns
+    ]
+
+    if missing_columns:
+        print("Error: Missing required columns:")
+        for column in missing_columns:
+            print(f"- {column}")
+        return
+
+    # Step 5: Standardize text columns
+    df["customer_name"] = df["customer_name"].apply(clean_text)
+    df["city"] = df["city"].apply(clean_text)
+
+    # Step 6: Standardize state to uppercase
+    df["state"] = df["state"].astype(str).str.strip().str.upper()
+
+    # Step 7: Clean phone numbers
+    df["phone"] = df["phone"].apply(clean_phone_number)
+
+    # Step 8: Clean ZIP codes
+    df["zip_code"] = df["zip_code"].apply(clean_zip_code)
+
+    # Step 9: Convert order date to real date format
+    df["order_date"] = pd.to_datetime(
+        df["order_date"],
+        errors="coerce"
+    )
+
+    # Step 10: Fill missing text values
+    df["customer_name"] = df["customer_name"].replace("", "Unknown")
+    df["city"] = df["city"].replace("", "Unknown")
+    df["state"] = df["state"].replace("", "Unknown")
+
+    # Step 11: Remove duplicate customer/order records
+    df = df.drop_duplicates(
+        subset=["customer_id", "order_date"],
+        keep="first"
+    )
+
+    # Step 12: Sort data
+    df = df.sort_values(
+        by=["state", "city", "customer_name"],
+        ascending=True
+    )
+
+    # Step 13: Export cleaned data
+    df.to_excel(output_file, index=False)
+
+    print("Data cleaning and standardization completed.")
+    print(f"Output file created: {output_file}")
+
+
+if __name__ == "__main__":
+    main()
