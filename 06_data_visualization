@@ -1,0 +1,64 @@
+"""
+Lesson 06 - Data Visualization
+
+This lesson teaches how to:
+1. Create a bar chart
+2. Create a line chart
+3. Save charts as PNG files
+"""
+
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+
+input_file = Path("sample_orders.xlsx")
+
+if not input_file.exists():
+    print("Error: sample_orders.xlsx was not found.")
+else:
+    df = pd.read_excel(input_file)
+
+    df.columns = (
+        df.columns
+        .str.strip()
+        .str.lower()
+        .str.replace(" ", "_")
+    )
+
+    df["total_amount"] = df["quantity"] * df["unit_price"]
+
+    category_summary = (
+        df.groupby("category")
+        .agg(total_amount=("total_amount", "sum"))
+        .reset_index()
+    )
+
+    plt.figure(figsize=(8, 5))
+    plt.bar(category_summary["category"], category_summary["total_amount"])
+    plt.title("Total Amount by Category")
+    plt.xlabel("Category")
+    plt.ylabel("Total Amount")
+    plt.tight_layout()
+    plt.savefig("total_amount_by_category.png")
+    plt.close()
+
+    daily_summary = (
+        df.groupby("date")
+        .agg(total_amount=("total_amount", "sum"))
+        .reset_index()
+    )
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(daily_summary["date"], daily_summary["total_amount"], marker="o")
+    plt.title("Total Amount by Date")
+    plt.xlabel("Date")
+    plt.ylabel("Total Amount")
+    plt.xticks(rotation=30)
+    plt.tight_layout()
+    plt.savefig("total_amount_by_date.png")
+    plt.close()
+
+    print("Charts created:")
+    print("- total_amount_by_category.png")
+    print("- total_amount_by_date.png")
