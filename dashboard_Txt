@@ -1,0 +1,1655 @@
+
+
+import sys, json
+from pathlib import Path
+from datetime import date
+
+try:
+    import pandas as pd
+except ImportError:
+    import subprocess
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'pandas', 'openpyxl', '-q'])
+    import pandas as pd
+
+
+# ---------------------------------------------------------------------------
+# COLUMN MAPPING
+# Each key maps to a list of accepted Excel column names (first exact match
+# wins; falls back to partial/case-insensitive). Add new aliases here if the
+# source file uses different column names in future versions.
+# ---------------------------------------------------------------------------
+COL_MAP = {
+   ###REF
+}
+
+
+# ---------------------------------------------------------------------------
+# SCENARIO NORMALIZATION
+# Raw values from the Scenario column → canonical display names used in JS.
+# Add new variants here if the source file uses different spellings.
+# ---------------------------------------------------------------------------
+SCENARIO_NORM = {
+     ###REF
+}
+# Display order in charts and tables — do not change without updating JS SC_COLORS too
+SCENARIO_ORDER = ['3C', '3C+2C', 'What-If']
+
+# ---------------------------------------------------------------------------
+# LOB DISPLAY DESCRIPTIONS
+# Maps LOB code → readable subtitle shown on product cards.
+# Add new LOB codes here as new plans are introduced.
+# ---------------------------------------------------------------------------
+LOB_DESCS = {
+     ###REF
+}
+
+
+# ---------------------------------------------------------------------------
+# HELPERS
+# ---------------------------------------------------------------------------
+
+def find_col(df, key, col_map=None):
+    """Resolve a logical key to an actual DataFrame column name.
+    Tries exact match first, then partial/case-insensitive substring match.
+    Pass col_map to use a mapping other than the default COL_MAP."""
+    if col_map is None:
+        col_map = COL_MAP
+    candidates = col_map.get(key, [key])
+    lower = {c.strip().lower(): c for c in df.columns}
+    for cand in candidates:
+        if cand.strip().lower() in lower:
+            return lower[cand.strip().lower()]
+    for cand in candidates:
+        for lo, col in lower.items():
+            if cand.strip().lower() in lo:
+                return col
+    return None
+
+
+def norm_sc(raw):
+    """Normalize raw scenario string to canonical name (e.g. '3C2C' → '3C+2C')."""
+    k = str(raw).strip().upper().replace(' ', '').replace('-', '').replace('+', '').replace('_', '')
+    return SCENARIO_NORM.get(k, str(raw).strip())
+
+
+def is_y(series):
+    """Return boolean Series — True where cell value is 'Y' (case-insensitive)."""
+    return series.astype(str).str.strip().str.upper() == 'Y'
+
+
+def safe_int(v):
+    """Convert value to int, returning 0 on NaN or error."""
+    try:
+        f = float(v)
+        return 0 if f != f else int(f)
+    except Exception:
+        return 0
+
+
+def safe_float(v):
+    """Convert value to float, returning 0.0 on NaN or error."""
+    try:
+        f = float(v)
+        return 0.0 if f != f else f
+    except Exception:
+        return 0.0
+
+
+# ---------------------------------------------------------------------------
+# DATASET BUILDER
+# Called twice by process_excel(): once for all rows, once for Expansion=Y only.
+#
+# Returns a dict with four keys:
+#   products          – {state: [{label, desc, s, total, unmet, unmet_sc}]}
+#   spec_data         – {state: {lob: [{name, total, '3C', '3C+2C', 'What-If'}]}}
+#   county_data       – {state: {lob: [{spec, county, expansion, mbr_na, ...sc keys}]}}
+#   scenarios_by_prod – {state: {lob: [list of scenario keys present for that LOB]}}
+# ---------------------------------------------------------------------------
+
+def _build_dataset(df, cols, states):
+    """Build the full data payload for one dataset (all rows or expansion rows)."""
+    products          = {}
+    spec_data         = {}
+    county_data       = {}
+    scenarios_by_prod = {}
+
+    for state in states:
+        sdf  = df[df[cols['state']].astype(str) == state]
+        lobs = sorted(sdf[cols['lob']].dropna().astype(str).unique())
+
+        products[state]          = []
+        spec_data[state]         = {}
+        county_data[state]       = {}
+        scenarios_by_prod[state] = {}
+
+        for lob in lobs:
+            ldf        = sdf[sdf[cols['lob']].astype(str) == lob]
+            sc_present = [s for s in SCENARIO_ORDER if s in ldf['_sc'].values]
+            scenarios_by_prod[state][lob] = sc_present
+
+            # ── Product-level % met per scenario ──
+            s_pcts = {}
+            for sc in sc_present:
+                scdf = ldf[ldf['_sc'] == sc]
+                t = len(scdf)
+                m = int(is_y(scdf[cols['met']]).sum()) if t else 0
+                s_pcts[sc] = round(m / t, 4) if t else 0.0
+
+            sc3c    = ldf[ldf['_sc'] == '3C']
+            total3c = len(sc3c)
+            if not total3c and '3C+2C' in ldf['_sc'].values:
+                sc3c    = ldf[ldf['_sc'] == '3C+2C']
+                total3c = len(sc3c)
+            unmet3c = int((~is_y(sc3c[cols['met']])).sum()) if total3c else 0
+
+            # Unmet row count per scenario (only for scenarios present in this LOB)
+            unmet_sc = {}
+            for sc in sc_present:
+                sc_df = ldf[ldf['_sc'] == sc]
+                if len(sc_df):
+                    unmet_sc[sc] = int((~is_y(sc_df[cols['met']])).sum())
+
+            products[state].append({
+                'label':    lob,
+                'desc':     LOB_DESCS.get(lob, lob),
+                's':        s_pcts,
+                'total':    total3c,
+                'unmet':    unmet3c,
+                'unmet_sc': unmet_sc,
+            })
+
+            # ── Specialty-level percentages ──
+            specs     = sorted(ldf[cols['specialty']].dropna().astype(str).unique())
+            spec_rows = []
+            for spec in specs:
+                spdf = ldf[ldf[cols['specialty']].astype(str) == spec]
+                row  = {'name': spec, 'total': len(spdf[spdf['_sc'] == '3C'])}
+                for sc in sc_present:
+                    sc_sp = spdf[spdf['_sc'] == sc]
+                    t = len(sc_sp)
+                    m = int(is_y(sc_sp[cols['met']]).sum()) if t else 0
+                    row[sc] = round(m / t, 4) if t else 0.0
+                spec_rows.append(row)
+            spec_data[state][lob] = spec_rows
+
+            # ── County-level data ──
+            if cols['county']:
+                counties  = sorted(ldf[cols['county']].dropna().astype(str).unique())
+                cnty_rows = []
+                for spec in specs:
+                    for county in counties:
+                        mask = (
+                            (ldf[cols['specialty']].astype(str) == spec) &
+                            (ldf[cols['county']].astype(str)    == county)
+                        )
+                        cell = ldf[mask]
+                        if len(cell) == 0:
+                            continue
+
+                        sc3c_cell = cell[cell['_sc'] == '3C']
+                        ref       = sc3c_cell.iloc[0] if len(sc3c_cell) else cell.iloc[0]
+
+                        row = {'spec': spec, 'county': county}
+                        row['spec_code']       = str(ref[cols['spec_code']]).strip() if cols['spec_code'] and pd.notna(ref[cols['spec_code']]) else spec
+                        row['expansion']       = str(ref[cols['expansion']]) if cols['expansion'] and pd.notna(ref[cols['expansion']]) else 'N'
+                        row['membersBase']     = safe_int(ref[cols['unmet_mbr']]) if cols['unmet_mbr'] else 0
+
+                        mbr_na = {}
+                        met_sc = {}   # actual Met Overall value per scenario ('Y' or 'N')
+                        fill_sc = {}  # actual Fillable Gap Indicator value per scenario
+                        for sc in sc_present:
+                            sc_cell = cell[cell['_sc'] == sc]
+                            if len(sc_cell) and cols['unmet_mbr']:
+                                mbr_na[sc] = safe_int(sc_cell[cols['unmet_mbr']].iloc[0])
+                            else:
+                                mbr_na[sc] = 0
+                            if len(sc_cell) and cols['met']:
+                                met_val = str(sc_cell[cols['met']].iloc[0]).strip().upper()
+                                met_sc[sc] = 'Y' if met_val == 'Y' else 'N'
+                            else:
+                                met_sc[sc] = 'N'
+                            if len(sc_cell) and cols['fillable']:
+                                fv = str(sc_cell[cols['fillable']].iloc[0]).strip()
+                                # treat empty, nan, none, or any all-dash value (-, --, ---) as empty
+                                fill_sc[sc] = '' if (not fv.strip('- ') or fv.lower() in ('nan', 'none')) else fv
+                            else:
+                                fill_sc[sc] = ''
+                            if len(sc_cell) and cols['pct']:
+                                row[sc] = round(safe_float(sc_cell[cols['pct']].iloc[0]) / 100.0, 4)
+                            elif len(sc_cell):
+                                cnt = int(is_y(sc_cell[cols['met']]).sum())
+                                row[sc] = round(cnt / len(sc_cell), 4)
+                            else:
+                                row[sc] = 0.0
+                        row['mbr_na']  = mbr_na
+                        row['met_sc']  = met_sc
+                        row['fill_sc'] = fill_sc
+
+                        cnty_rows.append(row)
+                county_data[state][lob] = cnty_rows
+            else:
+                county_data[state][lob] = []
+
+    return {
+        'products':          products,
+        'spec_data':         spec_data,
+        'county_data':       county_data,
+        'scenarios_by_prod': scenarios_by_prod,
+    }
+
+
+
+
+# ---------------------------------------------------------------------------
+# EXCEL PROCESSOR
+# Entry point: reads the file, resolves columns, builds both datasets,
+# and returns the combined payload that gets injected into the HTML template.
+# ---------------------------------------------------------------------------
+
+def process_excel(filepath):
+    print(f"Reading  : {filepath}")
+    df = pd.read_excel(filepath, engine='openpyxl')
+    df.columns = df.columns.str.strip()
+    print(f"Rows     : {len(df):,}  |  Columns: {list(df.columns)}")
+
+    cols = {k: find_col(df, k) for k in COL_MAP}
+    print("\nColumn mapping:")
+    for k, v in cols.items():
+        print(f"  {k:<14} → {v or 'NOT FOUND'}")
+
+    for req in ('state', 'lob', 'scenario', 'specialty', 'met'):
+        if not cols[req]:
+            raise ValueError(
+                f"Required column '{req}' not found.\n"
+                f"Tried    : {COL_MAP[req]}\n"
+                f"Available: {list(df.columns)}"
+            )
+
+    df['_sc'] = df[cols['scenario']].apply(norm_sc)
+
+    states = sorted(df[cols['state']].dropna().astype(str).unique())
+    print(f"\nStates   : {states}")
+
+    has_expansion = bool(cols['expansion'])
+
+    print("\n── Building ALL-rows dataset ──")
+    data_all = _build_dataset(df, cols, states)
+
+    if has_expansion:
+        df_exp = df[is_y(df[cols['expansion']])]
+        exp_row_count = len(df_exp)
+        print(f"\n── Building EXPANSION=Y dataset ({exp_row_count:,} rows) ──")
+        data_exp = _build_dataset(df_exp, cols, states)
+    else:
+        print("\n── No Expansion column found; expansion dataset = all ──")
+        data_exp = data_all
+
+    return {
+        'states':        states,
+        'has_expansion': has_expansion,
+        'all':           data_all,
+        'expansion':     data_exp,
+    }
+
+
+# ---------------------------------------------------------------------------
+# HTML template
+# ---------------------------------------------------------------------------
+
+HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Network Adequacy</title>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=Lora:wght@600&display=swap" rel="stylesheet"/>
+<style>
+/* ── DESIGN TOKENS ─────────────────────────────────────────
+   Change colours, shadows and radii here; everything else
+   references these variables automatically.              */
+:root{
+  --bg:#f3f0eb;--surface:#ffffff;--border:#e6e0d6;
+  --text:#18120d;--text2:#6a5d52;--text3:#a8998c;
+  --teal:#28997e;--teal-lt:#e2f3ef;
+  --green:#2b8549;--green-lt:#e2f0e8;
+  --amber:#d07c24;--amber-lt:#fdeedd;
+  --orange:#c05c14;--orange-lt:#fde8d4;
+  --rose:#cc4435;--rose-lt:#fbe9e7;
+  --purple:#7553bb;
+  --c3c:#28997e;--c32c:#d07c24;--cwif:#7553bb; /* scenario accent colours */
+  --unmet:#e5dfd4;                              /* unmet portion of bar/ring */
+  --sh:0 1px 3px rgba(0,0,0,.05),0 4px 14px rgba(0,0,0,.06);
+  --sh2:0 4px 10px rgba(0,0,0,.08),0 12px 30px rgba(0,0,0,.1);
+  --r:14px;--rsm:8px;
+}
+/* ── RESET & BASE ───────────────────────────────────────── */
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Sora',sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+.pg{display:none}.pg.on{display:block}
+
+/* ── TOP NAV ────────────────────────────────────────────── */
+nav{position:sticky;top:0;z-index:100;background:var(--surface);border-bottom:1px solid var(--border);
+    height:56px;display:flex;align-items:center;padding:0 28px;gap:4px;
+    box-shadow:0 2px 10px rgba(0,0,0,.04)}
+.logo{display:flex;align-items:center;gap:8px;cursor:pointer;margin-right:18px;flex-shrink:0}
+.logo-mark{width:28px;height:28px;background:var(--teal);border-radius:7px;display:grid;place-items:center}
+.logo-mark svg{width:13px;height:13px;fill:#fff}
+.logo-name{font-family:'Lora',serif;font-size:.92rem;font-weight:600;color:var(--text)}
+.nb{display:flex;align-items:center;gap:5px;padding:5px 12px;border-radius:var(--rsm);border:none;
+    background:none;font-family:'Sora',sans-serif;font-size:.74rem;font-weight:500;
+    color:var(--text2);cursor:pointer;transition:.14s}
+.nb:hover{background:var(--bg);color:var(--text)}
+.nb.on{background:var(--teal-lt);color:var(--teal);font-weight:600}
+.nb svg{width:13px;height:13px;flex-shrink:0}
+.nav-r{margin-left:auto;display:flex;align-items:center;gap:8px}
+.live{display:flex;align-items:center;gap:5px;background:var(--green-lt);border:1px solid #b2d8c2;
+      border-radius:20px;padding:4px 11px;font-size:.64rem;font-weight:600;color:var(--green)}
+.ldot{width:6px;height:6px;border-radius:50%;background:var(--green);animation:blink 2s infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.2}}
+.av{width:28px;height:28px;border-radius:50%;background:linear-gradient(135deg,var(--teal),var(--purple));
+    display:grid;place-items:center;font-size:.62rem;font-weight:700;color:#fff}
+
+.hero{background:var(--surface);border-bottom:1px solid var(--border);padding:22px 28px 18px;
+      display:flex;align-items:flex-end;justify-content:space-between;gap:14px;flex-wrap:wrap}
+.hero-l h1{font-family:'Lora',serif;font-size:1.7rem;font-weight:600;letter-spacing:-.02em;line-height:1}
+.hero-l p{font-size:.71rem;color:var(--text3);margin-top:5px}
+.bc-row{font-size:.7rem;color:var(--text3);display:flex;align-items:center;gap:6px;margin-bottom:7px}
+.bc{color:var(--teal);font-weight:600;cursor:pointer}.bc:hover{text-decoration:underline}
+
+/* ── STATE FILTER PILLS ─────────────────────────────────── */
+.pill-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.pill-lbl{font-size:.62rem;font-weight:700;text-transform:uppercase;letter-spacing:.12em;color:var(--text3);margin-right:2px}
+.pill{padding:6px 18px;border-radius:24px;border:1.5px solid var(--border);background:var(--surface);
+      font-family:'Sora',sans-serif;font-size:.73rem;font-weight:600;color:var(--text2);
+      cursor:pointer;transition:.15s}
+.pill:hover{border-color:var(--teal);color:var(--teal)}
+.pill.on{background:var(--teal);border-color:var(--teal);color:#fff;box-shadow:0 3px 10px rgba(40,153,126,.22)}
+
+/* ── NAS EXPANSION TOGGLE ───────────────────────────────────
+   Fixed width (310px) so enabled/disabled states are same size.
+   Uses visibility:hidden instead of display:none to hold space. */
+.exp-toggle-wrap{display:flex;align-items:center;gap:10px;
+                 background:var(--surface);border:1.5px solid var(--border);
+                 border-radius:var(--r);padding:10px 16px;
+                 box-shadow:var(--sh);transition:border-color .2s,background .2s;
+                 width:310px;flex-shrink:0}
+.exp-toggle-wrap.active{border-color:var(--green);background:var(--green-lt)}
+.exp-switch{position:relative;width:38px;height:22px;flex-shrink:0}
+.exp-switch input{opacity:0;width:0;height:0;position:absolute}
+.exp-track{position:absolute;inset:0;background:var(--border);border-radius:11px;cursor:pointer;transition:.25s}
+.exp-track::before{content:'';position:absolute;width:16px;height:16px;left:3px;top:3px;
+                   background:#fff;border-radius:50%;transition:.25s;
+                   box-shadow:0 1px 3px rgba(0,0,0,.2)}
+input:checked+.exp-track{background:var(--green)}
+input:checked+.exp-track::before{transform:translateX(16px)}
+.exp-lbl-wrap{display:flex;flex-direction:column;gap:1px;min-width:0}
+.exp-lbl-main{font-size:.74rem;font-weight:700;color:var(--text);transition:color .2s;
+              display:flex;align-items:center;gap:6px;white-space:nowrap}
+.exp-lbl-wrap.active .exp-lbl-main{color:var(--green)}
+.exp-lbl-sub{font-size:.6rem;color:var(--text3);font-weight:500;white-space:nowrap}
+.exp-badge{display:inline-flex;align-items:center;gap:4px;
+           background:var(--green);color:#fff;
+           font-size:.6rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;
+           padding:2px 8px;border-radius:20px;
+           visibility:hidden;transition:opacity .2s}
+.exp-badge.show{visibility:visible}
+
+.body{max-width:100%;margin:0;padding:24px 40px 80px}
+
+/* ── KPI CARDS ───────────────────────────────────────────────
+   Specialty tab uses 4 columns; county tab overrides to 5.
+   k-severe/k-high/k-moderate/k-low set the left-border accent. */
+.kpi-row{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:24px}
+#county-kpi-row{grid-template-columns:repeat(5,1fr)}
+.kpi-tile{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);
+          padding:14px 14px;box-shadow:var(--sh);animation:up .35s ease both;
+          position:relative;overflow:hidden;border-left:4px solid transparent}
+#county-kpi-row .kpi-tile{padding:12px 13px}
+#county-kpi-row .kpi-val{font-size:1.3rem}
+#county-kpi-row .kpi-lbl{font-size:.58rem}
+.kpi-tile.k-severe{border-left-color:var(--rose)}
+.kpi-tile.k-high{border-left-color:var(--orange)}
+.kpi-tile.k-moderate{border-left-color:var(--amber)}
+.kpi-tile.k-low{border-left-color:var(--green)}
+.kpi-lbl{font-size:.6rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;
+         color:var(--text3);margin-bottom:5px}
+.kpi-val{font-family:'Lora',serif;font-size:1.55rem;font-weight:600;line-height:1}
+.kpi-sub{font-size:.59rem;color:var(--text3);margin-top:4px;line-height:1.4}
+
+/* ── SCENARIO LEGEND BAR ─────────────────────────────────── */
+.legend{display:flex;align-items:center;background:var(--surface);border:1px solid var(--border);
+        border-radius:var(--rsm);padding:9px 16px;margin-bottom:20px;
+        box-shadow:var(--sh);flex-wrap:wrap;gap:4px}
+.leg{display:flex;align-items:center;gap:6px;font-size:.67rem;font-weight:500;color:var(--text2);padding:2px 8px}
+.leg-d{width:9px;height:9px;border-radius:50%;flex-shrink:0}
+.leg-sep{width:1px;height:14px;background:var(--border);margin:0 2px}
+.leg-note{margin-left:auto;font-size:.62rem;color:var(--text3);font-style:italic}
+
+.sec-lbl{font-size:.63rem;font-weight:700;text-transform:uppercase;letter-spacing:.12em;
+         color:var(--text3);margin-bottom:14px}
+
+/* ── PRODUCT CARDS (OVERVIEW) ───────────────────────────────
+   4-column grid; each card holds a donut ring + scenario rows. */
+.prod-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;min-width:0}
+.prod-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);
+           padding:20px;box-shadow:var(--sh);position:relative;overflow:hidden;
+           animation:up .4s ease both;transition:box-shadow .2s,transform .2s;
+           cursor:pointer;min-height:340px;display:flex;flex-direction:column}
+.prod-card:hover{box-shadow:var(--sh2);transform:translateY(-2px)}
+.pc-bar{position:absolute;top:0;left:0;right:0;height:4px}
+.pc-gap-banner{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.pc-gap-badge{display:inline-flex;align-items:center;gap:5px;font-size:.68rem;font-weight:700;padding:4px 10px;border-radius:20px}
+.pc-unmet{font-size:.65rem;font-weight:600;color:var(--text3)}
+.pc-unmet span{font-weight:700;color:var(--text)}
+.pc-head{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px}
+.pc-name{font-family:'Lora',serif;font-size:1.2rem;font-weight:600;line-height:1}
+.pc-desc{font-size:.62rem;color:var(--text3);margin-top:3px}
+.pc-go{font-size:.62rem;color:var(--teal);font-weight:600;margin-top:4px}
+.pc-state{font-size:.62rem;font-weight:700;padding:2px 9px;border-radius:20px;
+          background:var(--bg);color:var(--text3);border:1px solid var(--border)}
+.pc-donut-area{display:flex;align-items:center;gap:18px}
+.pc-dw{position:relative;flex-shrink:0;width:140px;height:140px}
+.pc-dw svg{display:block}
+.pc-dc{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;
+       justify-content:center;pointer-events:none}
+.pc-dc-v{font-family:'Lora',serif;font-size:1.25rem;font-weight:600;line-height:1}
+.pc-dc-l{font-size:.5rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;
+         color:var(--text3);margin-top:2px}
+.pc-sc-list{flex:1;display:flex;flex-direction:column;gap:10px}
+.pc-sc-row{display:flex;flex-direction:column;gap:3px}
+.pc-sc-top{display:flex;justify-content:space-between;align-items:center}
+.pc-sc-name{font-size:.65rem;font-weight:600;color:var(--text2);display:flex;align-items:center;gap:5px;white-space:nowrap}
+.pc-sc-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.pc-sc-pct{font-size:.73rem;font-weight:700}
+.pc-sc-track{height:4px;background:var(--bg);border-radius:3px;overflow:hidden}
+.pc-sc-fill{height:100%;border-radius:3px}
+.pc-foot{margin-top:auto;padding-top:12px;border-top:1px solid var(--border);
+         display:flex;justify-content:space-between;align-items:center}
+.pc-combos{font-size:.62rem;color:var(--text3)}
+.fix-path{display:inline-flex;align-items:center;gap:4px;font-size:.62rem;font-weight:600;padding:3px 9px;border-radius:6px}
+.fix-cred{background:#e8f0fe;color:#3b5bdb}
+.fix-loi {background:#fff4e6;color:#c05c14}
+.fix-rec {background:var(--rose-lt);color:var(--rose)}
+.fix-ok  {background:var(--green-lt);color:var(--green)}
+.pc-crit-alert{margin-top:8px;padding:5px 9px;border-radius:var(--rsm);
+  background:#fff1f0;border:1px solid #ffccc7;
+  display:flex;flex-wrap:wrap;align-items:center;gap:4px}
+.pc-crit-hd{font-size:.72rem;font-weight:800;color:#a8071a;flex-shrink:0;min-width:0;word-break:break-word}
+.pc-crit-tag{font-size:.68rem;font-weight:700;padding:1px 7px;border-radius:4px;
+  background:#ffd7d5;color:#7f1d1d;white-space:nowrap}
+.pc-crit-cnt{font-weight:500;opacity:.72;margin-left:2px}
+.gap-badge{display:inline-flex;align-items:center;gap:4px;font-size:.6rem;font-weight:700;
+           padding:3px 9px;border-radius:20px;white-space:nowrap}
+.gap-severe{background:var(--rose-lt);color:var(--rose)}
+.gap-high{background:var(--orange-lt);color:var(--orange)}
+.gap-moderate{background:var(--amber-lt);color:var(--amber)}
+.gap-low{background:var(--green-lt);color:var(--green)}
+
+/* ── SPECIALTY BAR CHART ─────────────────────────────────── */
+.chart-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);
+            padding:18px 22px;box-shadow:var(--sh);animation:up .35s ease both}
+.chart-hd{font-family:'Lora',serif;font-size:1rem;font-weight:600;margin-bottom:3px}
+.chart-sub{font-size:.63rem;color:var(--text3);margin-bottom:14px;line-height:1.4}
+.sbt{width:100%;overflow-x:auto}
+.sbt-inner{min-width:700px}
+.sbt-hdr{padding-bottom:8px;border-bottom:1.5px solid var(--border);
+         position:sticky;top:0;background:var(--surface);z-index:3}
+.col-lbl{font-size:.6rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--text3)}
+.col-bar-hdr{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.bar-leg{display:flex;align-items:center;gap:5px;font-size:.65rem;font-weight:600;color:var(--text2)}
+.bar-leg-sw{width:20px;height:6px;border-radius:3px}
+.sbt-row{border-bottom:1px solid #ede8e0;transition:background .1s}
+.sbt-row:last-child{border-bottom:none}
+.sbt-row:hover{background:#fdfaf7}
+.spec-label{font-size:.68rem;font-weight:600;color:var(--text);padding-right:10px;
+            white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bar-wrap{padding-right:10px;position:relative}
+.stacked-bar{position:relative;height:20px;background:var(--unmet);border-radius:5px;overflow:hidden;display:flex}
+.seg{height:100%;flex-shrink:0;transition:width .55s cubic-bezier(.34,1.1,.64,1)}
+.bar-lbl-overlay{position:absolute;top:0;left:0;right:0;bottom:0;pointer-events:none;z-index:4}
+.bar-lbl-tag{position:absolute;top:50%;transform:translate(-50%,-50%);font-size:.55rem;
+             font-weight:700;white-space:nowrap;color:rgba(255,255,255,.97);
+             text-shadow:0 1px 4px rgba(0,0,0,.5)}
+.val-cols{display:grid;gap:0}
+.val-cell{display:flex;flex-direction:column;align-items:center;gap:2px;padding:0 3px}
+.val-num{font-size:.64rem;font-weight:700}
+.val-minibar{width:100%;height:3px;border-radius:2px;background:var(--border);overflow:hidden}
+.val-minibar-fill{height:100%;border-radius:2px}
+
+/* ── DRILL-DOWN SUB-TABS (Specialty / County) ────────────── */
+.sub-tabs{background:var(--surface);border-bottom:1px solid var(--border);
+          padding:0 40px;display:flex;align-items:flex-end;gap:2px}
+.sub-tab{padding:12px 18px;border:none;background:none;font-family:'Sora',sans-serif;
+         font-size:.78rem;font-weight:600;color:var(--text3);cursor:pointer;
+         border-bottom:2.5px solid transparent;transition:.15s;
+         display:flex;align-items:center;gap:7px;margin-bottom:-1px}
+.sub-tab:hover{color:var(--text2)}
+.sub-tab.on{color:var(--teal);border-bottom-color:var(--teal)}
+.sub-tab svg{width:14px;height:14px;flex-shrink:0}
+.sub-pg{display:none}.sub-pg.on{display:block}
+
+/* ── COUNTY PERFORMANCE TABLE ───────────────────────────────
+   Compare buttons switch the base/compare scenario pair.
+   Gap result badges and delta colouring are computed in JS. */
+.county-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);
+             box-shadow:var(--sh);overflow:hidden;animation:up .3s ease both}
+.county-hd{padding:16px 20px;border-bottom:1px solid var(--border);
+           display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}
+.county-hd-l h2{font-family:'Lora',serif;font-size:1rem;font-weight:600}
+.county-hd-l p{font-size:.65rem;color:var(--text3);margin-top:3px}
+.county-search{display:flex;align-items:center;gap:7px;background:var(--bg);
+               border:1px solid var(--border);border-radius:var(--rsm);padding:6px 12px}
+.county-search input{border:none;background:none;font-family:'Sora',sans-serif;
+                     font-size:.73rem;color:var(--text);outline:none;width:180px}
+.county-search input::placeholder{color:var(--text3)}
+.county-table{width:100%;border-collapse:collapse}
+.county-table thead tr{background:var(--bg);border-bottom:1px solid var(--border)}
+.county-table th{padding:9px 16px;font-size:.6rem;font-weight:700;text-transform:uppercase;
+                 letter-spacing:.1em;color:var(--text3);text-align:left;white-space:nowrap}
+.county-table th.r{text-align:right}
+.county-table td{padding:10px 16px;font-size:.75rem;border-bottom:1px solid var(--border);vertical-align:middle}
+.county-table td.r{text-align:right}
+.county-table tr:last-child td{border-bottom:none}
+.county-table tr:hover td{background:#fdfaf7}
+.county-spec-tag{font-size:.6rem;font-weight:600;padding:2px 8px;border-radius:20px;
+                 background:var(--teal-lt);color:var(--teal)}
+.cmp-btn{padding:6px 16px;border-radius:20px;border:1.5px solid var(--border);background:var(--surface);
+         font-family:'Sora',sans-serif;font-size:.72rem;font-weight:600;cursor:pointer;
+         transition:.15s;color:var(--text2)}
+.cmp-btn:hover{border-color:var(--teal)}
+.cmp-btn.on{border-color:var(--teal);box-shadow:0 2px 8px rgba(40,153,126,.18)}
+.st-dot{width:26px;height:26px;border-radius:50%;display:inline-flex;align-items:center;
+        justify-content:center;font-size:.62rem;font-weight:800;flex-shrink:0}
+.st-y{background:#d4edda;color:var(--green)}
+.st-n{background:#fde8d4;color:var(--rose)}
+.gr-closed{color:var(--green);font-weight:700}
+.gr-improved{color:var(--amber);font-weight:700}
+.gr-declined{color:var(--rose);font-weight:700}
+.gr-met{color:var(--teal);font-weight:700}
+.gr-nochange{color:var(--text3);font-weight:700}
+.gr-noaccess{color:var(--text3);font-weight:700;font-style:italic}
+.fill-ind{display:inline-block;font-size:.67rem;font-weight:700;padding:3px 10px;border-radius:6px;white-space:nowrap}
+.fill-single{background:#ede9fe;color:#5b21b6}
+.fill-increase{background:var(--amber-lt);color:var(--amber)}
+.fill-none{color:var(--text3);font-size:.72rem}
+.filter-row th{background:var(--surface);padding:6px 8px;border-bottom:1.5px solid var(--border)}
+.col-filter-txt{width:100%;border:1px solid var(--border);border-radius:5px;
+                padding:4px 7px;font-family:'Sora',sans-serif;font-size:.65rem;
+                color:var(--text);background:var(--bg);outline:none}
+.col-filter-txt:focus{border-color:var(--teal)}
+.col-filter-sel{width:100%;border:1px solid var(--border);border-radius:5px;
+                padding:4px 5px;font-family:'Sora',sans-serif;font-size:.63rem;
+                color:var(--text);background:var(--bg);outline:none;cursor:pointer}
+.col-filter-sel:focus{border-color:var(--teal)}
+.delta-pos{color:var(--green);font-weight:700}
+.delta-neg{color:var(--rose);font-weight:700}
+.delta-zero{color:var(--text3);font-weight:600}
+.sc-view-btn{padding:5px 13px;border-radius:20px;border:1.5px solid var(--border);
+             background:var(--surface);font-family:'Sora',sans-serif;font-size:.68rem;
+             font-weight:600;color:var(--text2);cursor:pointer;transition:.15s}
+.sc-view-btn:hover{border-color:var(--teal);color:var(--teal)}
+.sc-view-btn.on{background:var(--c,var(--teal));border-color:var(--c,var(--teal));
+                color:#fff;box-shadow:0 3px 10px rgba(0,0,0,.15)}
+.cg{color:var(--green)}.ca{color:var(--amber)}.cr{color:var(--rose)}.ct{color:var(--teal)}.co{color:var(--orange)}
+@keyframes up{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+@media(max-width:1200px){.prod-grid{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:860px) {.prod-grid{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:560px) {.prod-grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="logo" onclick="goHome()">
+    <div class="logo-mark"><svg viewBox="0 0 16 16"><path d="M1 1h6v6H1zm8 0h6v6H9zM1 9h6v6H1zm8 0h6v6H9z"/></svg></div>
+    <span class="logo-name">NCR - Network Compliance & Reporting Team</span>
+  </div>
+  <button class="nb on" id="nb-ov" onclick="goHome()">
+    <svg viewBox="0 0 20 20" fill="currentColor"><path d="M3 4a1 1 0 011-1h3a1 1 0 011 1v3a1 1 0 01-1 1H4a1 1 0 01-1-1V4zm9 0a1 1 0 011-1h3a1 1 0 011 1v3a1 1 0 01-1 1h-3a1 1 0 01-1-1V4zM3 13a1 1 0 011-1h3a1 1 0 011 1v3a1 1 0 01-1 1H4a1 1 0 01-1-1v-3zm9 0a1 1 0 011-1h3a1 1 0 011 1v3a1 1 0 01-1 1h-3a1 1 0 01-1-1v-3z"/></svg>
+    Overview
+  </button>
+  <button class="nb" id="nb-dr" style="display:none" onclick="switchPage('pg2')">
+    <svg viewBox="0 0 20 20" fill="currentColor"><path d="M2 11a1 1 0 011-1h2a1 1 0 011 1v5a1 1 0 01-1 1H3a1 1 0 01-1-1v-5zm6-4a1 1 0 011-1h2a1 1 0 011 1v9a1 1 0 01-1 1H9a1 1 0 01-1-1V7zm6-3a1 1 0 011-1h2a1 1 0 011 1v12a1 1 0 01-1 1h-2a1 1 0 01-1-1V4z"/></svg>
+    <span id="nb-dr-lbl">Detail</span>
+  </button>
+  <div class="nav-r">
+    <div class="live"><span class="ldot"></span>Dashboard Generated: /*__GEN_DATE__*/</div>
+    <div class="av">NCR</div>
+  </div>
+</nav>
+
+<!-- PAGE 1: OVERVIEW -->
+<div id="pg1" class="pg on">
+  <div class="hero">
+    <div class="hero-l">
+      <h1>Network Adequacy</h1>
+      <p>Specialty &amp; County combinations · Click any product card to drill into specialties</p>
+    </div>
+  </div>
+  <div class="body">
+
+    <!-- State filter + NAS Expansion toggle on the same row -->
+    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:20px">
+      <div class="pill-row">
+        <span class="pill-lbl">State</span>
+        <div id="state-filter"></div>
+      </div>
+
+      <!-- NAS Expansion toggle — hidden if no expansion column in data -->
+      <div id="exp-toggle-wrap" class="exp-toggle-wrap" style="display:none">
+        <label class="exp-switch">
+          <input type="checkbox" id="exp-checkbox" onchange="onExpansionToggle(this.checked)"/>
+          <span class="exp-track"></span>
+        </label>
+        <div class="exp-lbl-wrap" id="exp-lbl-wrap">
+          <div class="exp-lbl-main">
+            Expansion
+            <span class="exp-badge" id="exp-badge">ON</span>
+          </div>
+          <div class="exp-lbl-sub" id="exp-lbl-sub">Showing expansion counties only</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="legend" id="ov-legend"></div>
+    <div class="sec-lbl" id="prod-sec-lbl">Product Cards</div>
+    <div class="prod-grid" id="prod-grid"></div>
+  </div>
+</div>
+
+<!-- PAGE 2: DRILL-DOWN -->
+<div id="pg2" class="pg">
+  <div class="hero">
+    <div class="hero-l">
+      <div class="bc-row">
+        <span class="bc" onclick="goHome()">← Overview</span>
+        <span>›</span>
+        <span id="bc-txt"></span>
+      </div>
+      <h1 id="dr-title"></h1>
+      <p id="dr-sub"></p>
+    </div>
+    <div class="pill-row" id="prod-switcher"></div>
+  </div>
+
+  <div class="sub-tabs">
+    <button class="sub-tab on" id="st-spec" onclick="switchSubTab('spec')">
+      <svg viewBox="0 0 20 20" fill="currentColor"><path d="M2 11a1 1 0 011-1h2a1 1 0 011 1v5a1 1 0 01-1 1H3a1 1 0 01-1-1v-5zm6-4a1 1 0 011-1h2a1 1 0 011 1v9a1 1 0 01-1 1H9a1 1 0 01-1-1V7zm6-3a1 1 0 011-1h2a1 1 0 011 1v12a1 1 0 01-1 1h-2a1 1 0 01-1-1V4z"/></svg>
+      Specialty Overview by Scenario
+    </button>
+    <button class="sub-tab" id="st-county" onclick="switchSubTab('county')">
+      <svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M5.05 4.05a7 7 0 119.9 9.9L10 18.9l-4.95-4.95a7 7 0 010-9.9zM10 11a2 2 0 100-4 2 2 0 000 4z" clip-rule="evenodd"/></svg>
+      County Gap & Access Detail
+    </button>
+  </div>
+
+  <div id="sp-spec" class="sub-pg on">
+    <div class="body">
+      <div class="kpi-row" id="dr-kpis"></div>
+      <div class="legend" id="dr-legend"></div>
+      <div class="chart-card">
+        <div class="chart-hd" id="chart-hd"></div>
+        <div class="chart-sub">Bar spans 0–100%. Each color shows the adequacy rate for that scenario.</div>
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;flex-wrap:wrap">
+          <span style="font-size:.62rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--text3)">View</span>
+          <button class="sc-view-btn on" data-sc="all"    onclick="setScView(this)">All Scenarios</button>
+          <button class="sc-view-btn"   data-sc="3C"      onclick="setScView(this)" style="--c:var(--c3c)">3C Only</button>
+          <button class="sc-view-btn"   data-sc="3C+2C"   onclick="setScView(this)" style="--c:var(--c32c)">3C+2C Only</button>
+          <button class="sc-view-btn"   data-sc="What-If" onclick="setScView(this)" style="--c:var(--cwif)">What-If Only</button>
+        </div>
+        <div class="sbt"><div class="sbt-inner" id="sbt"></div></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="sp-county" class="sub-pg">
+    <div class="body">
+      <div class="kpi-row" id="county-kpi-row" style="margin-bottom:20px"></div>
+      <div class="county-card">
+        <div class="county-hd">
+          <div class="county-hd-l">
+            <h2 id="county-hd-title"></h2>
+            <p id="county-hd-sub"></p>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <div class="county-search">
+              <svg width="13" height="13" viewBox="0 0 20 20" fill="currentColor" style="color:var(--text3)"><path fill-rule="evenodd" d="M8 4a4 4 0 100 8 4 4 0 000-8zM2 8a6 6 0 1110.89 3.476l4.817 4.817a1 1 0 01-1.414 1.414l-4.816-4.816A6 6 0 012 8z" clip-rule="evenodd"/></svg>
+              <input type="text" id="county-search-input" placeholder="Search specialty or county…" oninput="filterCountyTable()"/>
+            </div>
+          </div>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;padding:12px 20px;border-bottom:1px solid var(--border);flex-wrap:wrap;background:var(--bg)">
+          <span style="font-size:.62rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--text3)">Compare</span>
+          <div id="cmp-btns"></div>
+          <div style="margin-left:auto;font-size:.62rem;color:var(--text3);font-style:italic">
+            Gap closed = Base Met Overall = N → Compare Met Overall = Y &nbsp;·&nbsp; Delta = Compare% − Base%
+          </div>
+        </div>
+        <div style="overflow-x:auto"><table class="county-table" id="county-table"></table></div>
+        <div style="padding:12px 20px;border-top:1px solid var(--border);font-size:.62rem;color:var(--text3);line-height:1.6">
+          <b style="color:var(--text2)">Gap Result:</b>
+          <span style="margin:0 10px"><b style="color:var(--green)">Closed</b> — base Met Overall = N, compare Met Overall = Y</span>
+          <span style="margin:0 10px"><b style="color:var(--amber)">Improved, Still Open</b> — compare % higher than base but compare Met Overall still N</span>
+          <span style="margin:0 10px"><b style="color:var(--rose)">Declined</b> — compare % lower than base</span>
+          <span style="margin:0 10px"><b style="color:var(--teal)">Already Met</b> — both base and compare Met Overall = Y</span>
+          <span style="margin:0 10px"><b style="color:var(--text3)">No Change</b> — both scenarios equal %, neither Met Overall = Y</span>
+          <span style="margin:0 10px"><b style="color:var(--text3)">No Access</b> — both scenarios at 0%, no providers available</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ══════════════════════════════════════════════════════════
+   DATA — injected by generate_dashboard.py at build time.
+   Structure:
+     DATA.states          – sorted list of state strings
+     DATA.has_expansion   – true if Excel has an Expansion column
+     DATA.all             – full dataset (all rows)
+     DATA.expansion       – filtered dataset (Expansion = Y rows only)
+   Each dataset contains: products, spec_data, county_data, scenarios_by_prod
+   ══════════════════════════════════════════════════════════ */
+/*__DATA__*/
+
+var STATES        = DATA.states;
+var HAS_EXPANSION = DATA.has_expansion;
+
+/* Active dataset pointers — reassigned by setDataset() so all renders
+   automatically reflect whichever dataset is currently selected.      */
+var PRODUCTS, SPEC_DATA, COUNTY_DATA, SC_BY_PROD;
+
+// Swap all four dataset pointers at once; called on page load and toggle
+function setDataset(useExpansion) {
+  var d      = useExpansion ? DATA.expansion : DATA.all;
+  PRODUCTS   = d.products;
+  SPEC_DATA  = d.spec_data;
+  COUNTY_DATA = d.county_data;
+  SC_BY_PROD  = d.scenarios_by_prod;
+}
+setDataset(false);  /* boot with all-rows data */
+
+/* ══════════════════════════════════════════════════════════
+   EXPANSION TOGGLE
+   Switches the active dataset and re-renders every visible
+   section so all numbers reflect the new filter instantly.
+   ══════════════════════════════════════════════════════════ */
+var expansionMode = false;
+
+function onExpansionToggle(checked) {
+  expansionMode = checked;
+  setDataset(checked);
+
+  /* update toggle visual state */
+  var wrap    = document.getElementById('exp-toggle-wrap');
+  var lblWrap = document.getElementById('exp-lbl-wrap');
+  var badge   = document.getElementById('exp-badge');
+  var sub     = document.getElementById('exp-lbl-sub');
+  wrap.classList.toggle('active', checked);
+  lblWrap.classList.toggle('active', checked);
+  badge.classList.toggle('show', checked);
+  sub.textContent = checked
+    ? 'Showing expansion counties only'
+    : 'Showing expansion counties only';
+
+  /* re-render whatever page is visible */
+  renderStateFilter();
+  renderOvLegend();
+  renderProdGrid();
+  if(document.getElementById('pg2').classList.contains('on')){
+    buildDrill();
+    if(curSubTab === 'county') renderCountyTable();
+  }
+}
+
+/* ══════════════════════════════════════════════════════════
+   SHARED CONSTANTS & HELPERS
+   ══════════════════════════════════════════════════════════ */
+
+// Canonical order and accent colours for each scenario
+// Must match SCENARIO_ORDER / SCENARIO_NORM in generate_dashboard.py
+var SCENARIO_ORDER = ['3C','3C+2C','What-If'];
+var SC_COLORS = {'3C':'#28997e','3C+2C':'#d07c24','What-If':'#7553bb'};
+
+// Returns the list of scenarios available for a given state+LOB
+function getScenarios(state, lob) {
+  return (SC_BY_PROD[state] && SC_BY_PROD[state][lob]) || ['3C'];
+}
+
+// Gap severity thresholds: ≥90% = met, ≥75% = moderate, ≥45% = high, else severe
+function gapSev(v){
+  if(v>=.90) return 'low';
+  if(v>=.75) return 'moderate';
+  if(v>=.45) return 'high';
+  return 'severe';
+}
+// Derived helpers — all read from gapSev() so thresholds only need changing above
+function gapLabel(v){ return {low:'Low Gap',moderate:'Moderate Gap',high:'High Gap',severe:'Severe Gap'}[gapSev(v)]; }
+function gapClass(v){ return {low:'gap-low',moderate:'gap-moderate',high:'gap-high',severe:'gap-severe'}[gapSev(v)]; }
+function gapDotColor(v){ return {low:'var(--green)',moderate:'var(--amber)',high:'var(--orange)',severe:'var(--rose)'}[gapSev(v)]; }
+function gapBarColor(v){ return {low:'var(--green)',moderate:'var(--amber)',high:'var(--orange)',severe:'var(--rose)'}[gapSev(v)]; }
+function gapKpiClass(s){ return {low:'k-low',moderate:'k-moderate',high:'k-high',severe:'k-severe'}[s]; }
+
+// Determines the recommended fix action based on which scenario first hits 90%
+function fixPath(p, scenarios){
+  var v3  = p.s['3C']       || 0;
+  var v32 = scenarios.includes('3C+2C')   ? (p.s['3C+2C']   || 0) : -1;
+  var vwi = scenarios.includes('What-If') ? (p.s['What-If'] || 0) : -1;
+  if(v3  >= .90) return {label:'Maintain',              cls:'fix-ok',   icon:'✓'};
+  if(v32 >= .90) return {label:'Credential to resolve', cls:'fix-cred', icon:'📋'};
+  if(vwi >= .90) return {label:'LOI needed',            cls:'fix-loi',  icon:'📝'};
+  return                {label:'Needs recruitment',     cls:'fix-rec',  icon:'🚨'};
+}
+
+// Renders a multi-ring SVG donut chart. One ring per scenario, inner→outer.
+// Ring radii scale automatically based on how many scenarios are present.
+function donut(s, scenarios, sz) {
+  sz = sz || 140;
+  var cx = sz/2, cy = sz/2, n = scenarios.length;
+  var rInner = sz * (n===1 ? 0.28 : n===2 ? 0.19 : 0.15);
+  var rStep  = sz * (n===1 ? 0    : n===2 ? 0.14 : 0.12);
+  var sw     = sz * 0.065;
+  var o = '';
+  scenarios.forEach(function(sc, i){
+    var r   = rInner + i * rStep;
+    var pct = s[sc] || 0;
+    var c   = SC_COLORS[sc];
+    var ci  = 2 * Math.PI * r;
+    var d   = (ci * pct).toFixed(2);
+    var g   = (ci * (1-pct)).toFixed(2);
+    var off = (ci * .25).toFixed(2);
+    o += '<circle cx="'+cx+'" cy="'+cy+'" r="'+r+'" fill="none" stroke="#ede8e0" stroke-width="'+sw+'"/>';
+    o += '<circle cx="'+cx+'" cy="'+cy+'" r="'+r+'" fill="none" stroke="'+c+'" stroke-width="'+sw
+       +'" stroke-dasharray="'+d+' '+g+'" stroke-dashoffset="'+off+'" stroke-linecap="round"/>';
+  });
+  return '<svg width="'+sz+'" height="'+sz+'" viewBox="0 0 '+sz+' '+sz+'">'+o+'</svg>';
+}
+
+/* ══════════════════════════════════════════════════════════
+   PAGE 1 — OVERVIEW
+   State filter pills → product card grid with donut rings.
+   curState holds the currently selected state pill.
+   ══════════════════════════════════════════════════════════ */
+var curState = STATES[0] || '';
+
+// Renders the state pill buttons; highlights the active state
+function renderStateFilter(){
+  document.getElementById('state-filter').innerHTML =
+    STATES.map(function(s){
+      return '<button class="pill'+(s===curState?' on':'')+'" onclick="setOvState(\''+s+'\')">'+s+'</button>';
+    }).join('');
+}
+
+function setOvState(s){ curState=s; renderStateFilter(); renderOvLegend(); renderProdGrid(); }
+
+// Builds the colour-coded scenario legend strip from whichever scenarios are present in the state
+function renderOvLegend(){
+  var seen = [];
+  (PRODUCTS[curState]||[]).forEach(function(p){
+    getScenarios(curState, p.label).forEach(function(sc){
+      if(!seen.includes(sc)) seen.push(sc);
+    });
+  });
+  var scenarios = SCENARIO_ORDER.filter(function(s){ return seen.includes(s); });
+  var parts = scenarios.map(function(sc){
+    return '<div class="leg"><span class="leg-d" style="background:'+SC_COLORS[sc]+'"></span>'+sc+'</div>';
+  });
+  document.getElementById('ov-legend').innerHTML = parts.join('<div class="leg-sep"></div>');
+}
+
+// Renders all product cards for the active state; each card has a donut + scenario breakdown
+function renderProdGrid(){
+  var st    = curState;
+  var prods = PRODUCTS[st] || [];
+  var lbl   = expansionMode ? 'Product Cards — '+st+' (Expansion = Y only)' : 'Product Cards — '+st;
+  document.getElementById('prod-sec-lbl').textContent = lbl;
+
+  document.getElementById('prod-grid').innerHTML = prods.map(function(p, i){
+    var v3        = p.s['3C'] || 0;
+    var scenarios = getScenarios(st, p.label);
+    var uc        = p.unmet || 0;
+    var fp        = fixPath(p, scenarios);
+    var gc        = gapClass(v3);
+    var barC      = gapBarColor(v3);
+
+    // Critical specialty gap detection.
+    // Uses the first available scenario in order (3C → 3C+2C → What-If)
+    // so cards still show alerts even when 3C is absent for that product.
+    var critSc   = scenarios[0] || '3C';
+    var cntyRows = (COUNTY_DATA[st] && COUNTY_DATA[st][p.label]) || [];
+
+    function countCritGap(specTest){
+      return cntyRows.filter(function(r){
+        if(!r.spec || !r.met_sc) return false;
+        var s = r.spec.toLowerCase();
+        return specTest(s) && r.met_sc[critSc] === 'N';
+      }).length;
+    }
+    // Pediatric: ONLY matches the bare word "Pediatric/Pediatrics" (e.g. specialty = "Pediatric")
+    //            OR specialty contains BOTH "pediatric" AND "primary" (e.g. "Pediatric Primary Care")
+    //            "Pediatrics Sub", "Pediatric Density", etc. do NOT qualify.
+    // PCP: contains "primary care" but NOT "pediatric" (those belong to Pediatric group)
+    // OB/GYN: contains "ob/gyn", "ob-gyn", or "ob gyn"
+    var cntHospital  = countCritGap(function(s){ return s.includes('inpatient hospital'); });
+    var cntPCP       = countCritGap(function(s){ return s.includes('primary care') && !s.includes('pediatric'); });
+    var cntOBGYN     = countCritGap(function(s){ return s.includes('ob/gyn') || s.includes('ob-gyn') || s.includes('ob gyn'); });
+    var cntPediatric = countCritGap(function(s){
+      var pedOnly        = /^pediatrics?$/.test(s.trim());
+      var pedWithPrimary = s.includes('pediatric') && s.includes('primary');
+      return (pedOnly || pedWithPrimary) && !s.includes('density');
+    });
+
+    var scRows = scenarios.map(function(k){
+      var v = p.s[k] || 0;
+      return '<div class="pc-sc-row">'
+        +'<div class="pc-sc-top">'
+        +'<div class="pc-sc-name"><span class="pc-sc-dot" style="background:'+SC_COLORS[k]+'"></span>'+k+'</div>'
+        +'<span class="pc-sc-pct" style="color:'+SC_COLORS[k]+'">'+(v*100).toFixed(1)+'%</span>'
+        +'</div>'
+        +'<div class="pc-sc-track"><div class="pc-sc-fill" style="width:'+(v*100)+'%;background:'+SC_COLORS[k]+'"></div></div>'
+        +'</div>';
+    }).join('');
+
+    return '<div class="prod-card" style="animation-delay:'+(i*.06)+'s" onclick="goDrill(\''+st+'\','+i+')">'
+      +'<div class="pc-bar" style="background:'+barC+'"></div>'
+      +'<div class="pc-gap-banner">'
+      +'<span class="pc-gap-badge '+gc+'">'+gapLabel(v3)+'</span>'
+      +'<span class="pc-unmet"><span>'+uc.toLocaleString()+'</span> Open Gaps</span>'
+      +'</div>'
+      +'<div class="pc-head"><div>'
+      +'<div class="pc-name">'+p.label+'</div>'
+      +'<div class="pc-desc">'+p.desc+'</div>'
+      +'<div class="pc-go">View specialty detail →</div>'
+      +'</div><span class="pc-state">'+st+'</span></div>'
+      +'<div class="pc-donut-area">'
+      +'<div class="pc-dw">'+donut(p.s, scenarios, 140)
+      +'<div class="pc-dc">'
+      +'<div class="pc-dc-v" style="color:'+barC+'">'+(v3*100).toFixed(0)+'%</div>'
+      +'<div class="pc-dc-l">3C</div>'
+      +'</div></div>'
+      +'<div class="pc-sc-list">'+scRows+'</div>'
+      +'</div>'
+      +'<div class="pc-foot">'
+      +'<span class="pc-combos">'+(p.total||0).toLocaleString()+' Total 3C Specialty-County Combos</span>'
+      +'<span class="fix-path '+fp.cls+'">'+fp.icon+' '+fp.label+'</span>'
+      +'</div>'
+      +(function(){
+          var tags = [];
+          if(cntHospital)  tags.push(['Hospital',  cntHospital]);
+          if(cntPCP)       tags.push(['PCP',        cntPCP]);
+          if(cntOBGYN)     tags.push(['OB/GYN',     cntOBGYN]);
+          if(cntPediatric) tags.push(['Pediatric',  cntPediatric]);
+          if(!tags.length) return '';
+          return '<div class="pc-crit-alert">'
+            +'<span class="pc-crit-hd">⚠ Critical ('+critSc+') — Major Specialty Not Meeting Adequacy:</span>'
+            +tags.map(function(t){
+              return '<span class="pc-crit-tag">'+t[0]
+                +'<span class="pc-crit-cnt">('+t[1]+' combo'+(t[1]===1?'':'s')+')</span>'
+                +'</span>';
+            }).join('')
+            +'</div>';
+        }())
+      +'</div>';
+  }).join('');
+}
+
+/* ══════════════════════════════════════════════════════════
+   PAGE 2 — DRILL-DOWN
+   Two sub-tabs: Specialty Gap Analysis | County Performance.
+   curProd   = index into PRODUCTS[curState]
+   curSubTab = 'spec' | 'county'
+   curScView = 'all' | '3C' | '3C+2C' | 'What-If'
+   ══════════════════════════════════════════════════════════ */
+var curProd   = 0;
+var curSubTab = 'spec';
+var curScView = 'all';
+
+// Navigate from overview card click to drill-down page
+function goDrill(state, prodIdx){
+  curState=state; curProd=prodIdx; curSubTab='spec'; curScView='all';
+  ['spec','county'].forEach(function(t){
+    document.getElementById('st-'+t).classList.toggle('on', t==='spec');
+    document.getElementById('sp-'+t).classList.toggle('on', t==='spec');
+  });
+  document.querySelectorAll('.sc-view-btn').forEach(function(b,i){ b.classList.toggle('on',i===0); });
+  buildDrill();
+  switchPage('pg2');
+}
+
+// Builds the entire drill-down page: breadcrumb, KPI tiles, legend, chart header
+function buildDrill(){
+  var st        = curState;
+  var prod      = (PRODUCTS[st]||[])[curProd];
+  if(!prod) return;
+  var scenarios = getScenarios(st, prod.label);
+
+  document.getElementById('bc-txt').textContent   = st+' · '+prod.label;
+  document.getElementById('dr-title').textContent = st+' — '+prod.label+(expansionMode?' (Expansion = Y)':'');
+  document.getElementById('dr-sub').textContent   = prod.desc+' · Specialty-level gap analysis by scenario';
+  document.getElementById('nb-dr-lbl').textContent= 'Detail';
+
+  document.getElementById('prod-switcher').innerHTML =
+    '<span class="pill-lbl">Product</span>'+
+    (PRODUCTS[st]||[]).map(function(p,i){
+      return '<button class="pill'+(i===curProd?' on':'')+'" onclick="switchDrillProd('+i+')">'+p.label+'</button>';
+    }).join('');
+
+  var specs      = (SPEC_DATA[st]&&SPEC_DATA[st][prod.label]) || [];
+  var totalUnmet = prod.unmet || 0;
+  var unmetSc    = prod.unmet_sc || {};
+
+  function fmtUnmet(sc){
+    if(!scenarios.includes(sc)) return 'N/A';
+    var v = unmetSc[sc];
+    return v !== undefined ? v.toLocaleString() : '0';
+  }
+
+  /* Fixable by Credentialing = -(Unmet(3C+2C) − Unmet(3C))
+     positive result → fewer unmet with credentialing → show as +N (green)
+     negative result → more unmet with credentialing  → show as -N (red)   */
+  var credVal, credColor, credSub;
+  if(!scenarios.includes('3C+2C')){
+    credVal   = 'N/A';
+    credColor = null;
+    credSub   = 'Scenario not available for this product';
+  } else {
+    var u32c      = unmetSc['3C+2C'] !== undefined ? unmetSc['3C+2C'] : 0;
+    var reduction = totalUnmet - u32c;          /* = -(u32c - totalUnmet) */
+    if(reduction > 0){
+      credVal   = '+' + reduction.toLocaleString();
+      credColor = 'var(--green)';
+      credSub   = 'Fewer unmet combos gained through credentialing';
+    } else if(reduction < 0){
+      credVal   = reduction.toLocaleString();   /* JS already prefixes minus */
+      credColor = 'var(--rose)';
+      credSub   = 'More unmet combos compared to 3C baseline';
+    } else {
+      credVal   = '0';
+      credColor = 'var(--text3)';
+      credSub   = 'No change from credentialing';
+    }
+  }
+
+  document.getElementById('dr-kpis').innerHTML = [
+    {lbl:'Unmet Combos (3C)',       val:totalUnmet.toLocaleString(), c:'cr',       sub:'Rows where Met Overall = N on 3C',      k:'k-severe'},
+    {lbl:'Unmet Combos (3C & 2C)',  val:fmtUnmet('3C+2C'),          c:'co',       sub:'Rows where Met Overall = N on 3C+2C',  k:'k-high'},
+    {lbl:'Unmet Combos (What-If)',  val:fmtUnmet('What-If'),        c:'ca',       sub:'Rows where Met Overall = N on What-If',k:'k-moderate'},
+    {lbl:'Fixable by Credentialing',val:credVal,                    c:'_cred',    sub:credSub,                                k:'k-low'},
+  ].map(function(k,i){
+    var isNA   = k.val === 'N/A';
+    var isCred = k.c  === '_cred';
+    var valEl;
+    if(isNA){
+      valEl = '<div class="kpi-val" style="font-family:\'Sora\',sans-serif;font-size:.95rem;font-weight:600;color:var(--text3)">N/A</div>';
+    } else if(isCred){
+      valEl = '<div class="kpi-val" style="color:'+(credColor||'var(--text3)')+'">'+k.val+'</div>';
+    } else {
+      valEl = '<div class="kpi-val '+k.c+'">'+k.val+'</div>';
+    }
+    var subTxt = (isNA && !isCred) ? 'Scenario not available for this product' : k.sub;
+    return '<div class="kpi-tile '+k.k+'" style="animation-delay:'+(i*.04)+'s">'
+      +'<div class="kpi-lbl">'+k.lbl+'</div>'
+      +valEl
+      +'<div class="kpi-sub">'+subTxt+'</div></div>';
+  }).join('');
+
+  var legParts = scenarios.map(function(sc){
+    var desc = sc==='3C'?'current contracted network':sc==='3C+2C'?'includes credentialing pipeline':'includes LOI pipeline';
+    return '<div class="leg"><span class="leg-d" style="background:'+SC_COLORS[sc]+'"></span>'+sc+' — '+desc+'</div>';
+  });
+  legParts.push('<div class="leg"><span class="leg-d" style="background:var(--unmet);border:1px solid var(--border)"></span>Still unmet</div>');
+  document.getElementById('dr-legend').innerHTML = legParts.join('<div class="leg-sep"></div>');
+
+  document.getElementById('chart-hd').textContent = prod.label+' · '+st+' — Specialty Overview by Scenario';
+  renderStackedBar();
+}
+
+// Switch to a different product within the same state on the drill-down page
+function switchDrillProd(i){
+  curProd=i; curScView='all';
+  document.querySelectorAll('.sc-view-btn').forEach(function(b,idx){ b.classList.toggle('on',idx===0); });
+  buildDrill();
+  if(curSubTab === 'county') renderCountyTable();
+}
+
+// Filter the specialty bar chart to show one scenario or all
+function setScView(btn){
+  curScView=btn.dataset.sc;
+  document.querySelectorAll('.sc-view-btn').forEach(function(b){ b.classList.remove('on'); });
+  btn.classList.add('on');
+  renderStackedBar();
+}
+
+// Renders the horizontal stacked bar chart for all specialties in the current product
+function renderStackedBar(){
+  var st        = curState;
+  var prod      = (PRODUCTS[st]||[])[curProd];
+  if(!prod) return;
+  var scenarios = getScenarios(st, prod.label);
+  var specs     = (SPEC_DATA[st]&&SPEC_DATA[st][prod.label]) || [];
+  var mode      = (curScView==='all'||scenarios.includes(curScView)) ? curScView : 'all';
+  var showAll   = mode==='all';
+
+  document.querySelectorAll('.sc-view-btn').forEach(function(btn){
+    var sc=btn.dataset.sc;
+    btn.style.display=(sc==='all'||scenarios.includes(sc))?'':'none';
+  });
+
+  var gridTpl = '180px 1fr';
+
+  var legItems = showAll
+    ? scenarios.map(function(sc){
+        return '<div class="bar-leg"><div class="bar-leg-sw" style="background:'+SC_COLORS[sc]+'"></div>'+sc+'</div>';
+      }).join('')+'<div class="bar-leg"><div class="bar-leg-sw" style="background:var(--unmet);border:1px solid var(--border)"></div>Unmet</div>'
+    : '<div class="bar-leg"><div class="bar-leg-sw" style="background:'+SC_COLORS[mode]+'"></div>'+mode+'</div>'
+      +'<div class="bar-leg"><div class="bar-leg-sw" style="background:var(--unmet);border:1px solid var(--border)"></div>Unmet</div>';
+
+  var html = '<div class="sbt-hdr"><div style="display:grid;grid-template-columns:'+gridTpl+';align-items:center">'
+    +'<div class="col-lbl">Specialty</div>'
+    +'<div class="col-bar-hdr">'+legItems+'</div>'
+    +'</div></div>';
+
+  specs.forEach(function(sp){
+    var v3     = sp['3C'] || 0;
+    var sevDot = '<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:'+gapDotColor(v3)+';flex-shrink:0;margin-right:4px"></span>';
+    var barHtml='';
+
+    if(showAll){
+      var segs=[]; var prev=0;
+      scenarios.forEach(function(sc,i){
+        var v=sp[sc]||0;
+        if(i===0){ segs.push({sc:sc,w:v*100,lbl:(v*100).toFixed(0)+'%'}); prev=v; }
+        else{ var inc=Math.max(0,v-prev); segs.push({sc:sc,w:inc*100,lbl:(inc*100).toFixed(0)+'%'}); if(v>prev)prev=v; }
+      });
+      var bestPct=Math.max.apply(null,scenarios.map(function(sc){ return sp[sc]||0; }))*100;
+      var unmet=Math.max(0,100-bestPct);
+      var cursor=0;
+      var labels=segs.map(function(seg){
+        var mid=cursor+seg.w/2; cursor+=seg.w;
+        return seg.w>1.5?'<span class="bar-lbl-tag" style="left:'+mid.toFixed(1)+'%">'+seg.lbl+'</span>':'';
+      }).join('');
+      barHtml='<div class="stacked-bar"><div class="bar-lbl-overlay">'+labels+'</div>'
+        +segs.map(function(seg){ return seg.w>0.2?'<div class="seg" style="width:'+seg.w.toFixed(2)+'%;background:'+SC_COLORS[seg.sc]+'"></div>':''; }).join('')
+        +(unmet>0.5?'<div class="seg" style="flex:1;background:var(--unmet)"></div>':'')+'</div>';
+    } else {
+      var v=sp[mode]||0; var pct=v*100; var col=SC_COLORS[mode]; var mid=pct/2;
+      barHtml='<div class="stacked-bar"><div class="bar-lbl-overlay"><span class="bar-lbl-tag" style="left:'+mid.toFixed(1)+'%">'+pct.toFixed(0)+'%</span></div>'
+        +'<div class="seg" style="width:'+pct.toFixed(2)+'%;background:'+col+'"></div>'
+        +((100-pct)>0.5?'<div class="seg" style="flex:1;background:var(--unmet)"></div>':'')+'</div>';
+    }
+    html+='<div class="sbt-row"><div style="display:grid;grid-template-columns:'+gridTpl+';align-items:center;padding:4px 0">'
+      +'<div class="spec-label">'+sevDot+sp.name+'</div>'
+      +'<div class="bar-wrap">'+barHtml+'</div>'+'</div></div>';
+  });
+  document.getElementById('sbt').innerHTML=html;
+}
+
+/* ══════════════════════════════════════════════════════════
+   COUNTY GAP & ACCESS DETAIL TAB
+   countyRows   = raw rows for current state+LOB from COUNTY_DATA
+   curCmpMode   = key into CMP_MODES ('3c-vs-32c' etc.)
+   CMP_MODES    = defines which scenarios are base vs compare,
+                  their display colours, and which scenarios
+                  must exist for that mode to be available.
+   ══════════════════════════════════════════════════════════ */
+var countyRows=[], curCmpMode='';
+
+// Add new compare combinations here if more scenarios are introduced
+var CMP_MODES = {
+  '3c-vs-32c': {baseKey:'3C',    cmpKey:'3C+2C',  baseColor:'var(--c3c)', cmpColor:'var(--c32c)',baseLabel:'3C % Access',   cmpLabel:'3C+2C % Access',  needs:['3C+2C']},
+  '32c-vs-wif':{baseKey:'3C+2C', cmpKey:'What-If',baseColor:'var(--c32c)',cmpColor:'var(--cwif)',baseLabel:'3C+2C % Access',cmpLabel:'What-If % Access',needs:['3C+2C','What-If']},
+  '3c-vs-wif': {baseKey:'3C',    cmpKey:'What-If',baseColor:'var(--c3c)', cmpColor:'var(--cwif)',baseLabel:'3C % Access',   cmpLabel:'What-If % Access',needs:['What-If']},
+};
+
+// Renders compare mode buttons; hides modes whose required scenarios are absent
+function renderCmpButtons(scenarios){
+  document.getElementById('cmp-btns').innerHTML = Object.keys(CMP_MODES).map(function(key){
+    var m=CMP_MODES[key];
+    if(!m.needs.every(function(s){ return scenarios.includes(s); })) return '';
+    return '<button class="cmp-btn'+(key===curCmpMode?' on':'')+'" data-cmp="'+key+'" onclick="setCmpMode(this)" style="margin-right:6px">'
+      +'<span style="color:'+m.baseColor+'">'+m.baseKey+'</span> vs <span style="color:'+m.cmpColor+'">'+m.cmpKey+'</span>'
+      +'</button>';
+  }).join('');
+}
+
+// Called when user clicks a compare button — updates table and KPI cards
+function setCmpMode(btn){
+  curCmpMode=btn.dataset.cmp;
+  document.querySelectorAll('#cmp-btns .cmp-btn').forEach(function(b){ b.classList.remove('on'); });
+  btn.classList.add('on');
+  resetColFilters();
+  buildCountyTable(countyRows);
+  renderCountyKPIs();
+}
+
+// Tracks the active single scenario (null when in multi-scenario compare mode)
+var curSingleSc = null;
+
+// Entry point for the county sub-tab: loads rows and triggers table + KPI render
+function _esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function _escAttr(s){ return _esc(s).replace(/"/g,'&quot;'); }
+
+function renderCountyTable(){
+  var st=curState, prod=(PRODUCTS[st]||[])[curProd];
+  if(!prod) return;
+  var scenarios=getScenarios(st,prod.label);
+  document.getElementById('county-hd-title').textContent=prod.label+' · County Gap & Access Detail';
+  document.getElementById('county-hd-sub').textContent=st+' · '+prod.desc+(expansionMode?' (Expansion = Y only)':'');
+  countyRows=(COUNTY_DATA[st]&&COUNTY_DATA[st][prod.label])||[];
+  document.getElementById('county-search-input').value='';
+  resetColFilters();
+
+  if(scenarios.length === 1){
+    // Single scenario — hide compare buttons, show simplified table
+    curSingleSc = scenarios[0];
+    document.getElementById('cmp-btns').innerHTML =
+      '<span style="font-size:.68rem;color:var(--text3);font-style:italic">Single scenario — no comparison available</span>';
+    buildSingleScenarioTable(countyRows, curSingleSc);
+    renderCountyKPIs();
+    return;
+  }
+
+  // Multi-scenario compare mode
+  curSingleSc = null;
+  var validModes=Object.keys(CMP_MODES).filter(function(key){
+    return CMP_MODES[key].needs.every(function(s){ return scenarios.includes(s); });
+  });
+  if(!validModes.includes(curCmpMode)) curCmpMode=validModes[0]||'3c-vs-32c';
+  renderCmpButtons(scenarios);
+  buildCountyTable(countyRows);
+  renderCountyKPIs();
+}
+
+// Column-level filter state; reset whenever compare mode or product changes
+var colFilters={county:'',spec:'',expansion:'all',baseStatus:'all',cmpStatus:'all',gapResult:'all',fillInd:'all'};
+function resetColFilters(){ colFilters={county:'',spec:'',expansion:'all',baseStatus:'all',cmpStatus:'all',gapResult:'all',fillInd:'all'}; }
+
+// Gap outcome uses actual Met Overall value (bMet/cMet = 'Y'/'N') for met conditions;
+// falls back to % comparison for direction (improved/declined/no change)
+function gapResult(bV,cV,bMet,cMet){
+  if(bMet==='Y'&&cMet==='Y')    return {label:'Already Met',          cls:'gr-met'};
+  if(bMet==='N'&&cMet==='Y')    return {label:'Closed',               cls:'gr-closed'};
+  if(cV>bV)                     return {label:'Improved, Still Open',  cls:'gr-improved'};
+  if(bV===0&&cV===0)            return {label:'No Access',             cls:'gr-noaccess'};
+  if(Math.abs(cV-bV)<0.0001)   return {label:'No Change',             cls:'gr-nochange'};
+  return                               {label:'Declined',              cls:'gr-declined'};
+}
+// Used only for KPI tile counts — based on met_sc Y/N
+function fillableInd(bV,cV,bMet,cMet){
+  if(bMet==='Y') return null;
+  if(cMet==='Y') return {label:'Fillable by single provider',   cls:'fill-single'};
+  if(cV>bV)      return {label:'Increase in access by single provider',cls:'fill-increase'};
+  return null;
+}
+
+// Builds the Fillable Indicator cell content for the table column.
+// Logic:
+//   Both met_sc = Y            → —
+//   At least one N, read fill_sc for each N scenario:
+//     both empty               → —
+//     both same value          → show value once
+//     both different values    → (BaseKey) val1; (CmpKey) val2
+//     only one has value       → show that value
+function buildFillableDisplay(r, m){
+  var bMet=r.met_sc?(r.met_sc[m.baseKey]||'N'):'N';
+  var cMet=r.met_sc?(r.met_sc[m.cmpKey] ||'N'):'N';
+  if(bMet==='Y'&&cMet==='Y') return '<span class="fill-none">—</span>';
+  var fs=r.fill_sc||{};
+  var bVal=(bMet==='N')?(fs[m.baseKey]||''):'';
+  var cVal=(cMet==='N')?(fs[m.cmpKey] ||''):'';
+  if(!bVal&&!cVal) return '<span class="fill-none">—</span>';
+  var bC=SC_COLORS[m.baseKey]||'var(--teal)', cC=SC_COLORS[m.cmpKey]||'var(--amber)';
+  var sty='font-size:.65rem;font-weight:600;line-height:1.6';
+  // same value in both — show scenario prefix + value once
+  if(bVal&&cVal&&bVal.toLowerCase()===cVal.toLowerCase())
+    return '<span style="'+sty+'"><span style="color:'+bC+';">('+m.baseKey+')</span> '+bVal+'</span>';
+  // different values — show both with their scenario prefix
+  if(bVal&&cVal)
+    return '<span style="'+sty+'">'
+      +'<span style="color:'+bC+';">('+m.baseKey+')</span> '+bVal+'; '
+      +'<span style="color:'+cC+';">('+m.cmpKey+')</span> '+cVal+'</span>';
+  // only one has value — still show the scenario it belongs to
+  if(bVal)
+    return '<span style="'+sty+'"><span style="color:'+bC+';">('+m.baseKey+')</span> '+bVal+'</span>';
+  return '<span style="'+sty+'"><span style="color:'+cC+';">('+m.cmpKey+')</span> '+cVal+'</span>';
+}
+
+// Applies all active column filters to the county rows array
+function applyColFilters(rows){
+  var m=CMP_MODES[curCmpMode]; if(!m) return rows;
+  return rows.filter(function(r){
+    var base=r[m.baseKey]||0,cmp=r[m.cmpKey]||0;
+    var bMet=r.met_sc?(r.met_sc[m.baseKey]||'N'):(base>=.90?'Y':'N');
+    var cMet=r.met_sc?(r.met_sc[m.cmpKey] ||'N'):(cmp >=.90?'Y':'N');
+    var gr=gapResult(base,cmp,bMet,cMet);
+    if(colFilters.county&&!r.county.toLowerCase().includes(colFilters.county.toLowerCase())) return false;
+    if(colFilters.spec&&!r.spec.toLowerCase().includes(colFilters.spec.toLowerCase()))       return false;
+    if(colFilters.expansion!=='all'&&r.expansion!==colFilters.expansion)                     return false;
+    if(colFilters.baseStatus!=='all'&&bMet!==colFilters.baseStatus)                          return false;
+    if(colFilters.cmpStatus!=='all'&&cMet!==colFilters.cmpStatus)                            return false;
+    if(colFilters.gapResult!=='all'&&gr.label!==colFilters.gapResult)                        return false;
+    if(colFilters.fillInd!=='all'){
+      var fs=r.fill_sc||{};
+      var bFill=(bMet==='N')?(fs[m.baseKey]||''):'';
+      var cFill=(cMet==='N')?(fs[m.cmpKey]||''):'';
+      if(colFilters.fillInd==='none'){ if(bFill||cFill) return false; }
+      else{ var fi=colFilters.fillInd.toLowerCase(); if(!bFill.toLowerCase().includes(fi)&&!cFill.toLowerCase().includes(fi)) return false; }
+    }
+    return true;
+  });
+}
+
+function renderCountyKPIs(){
+  var el=document.getElementById('county-kpi-row');
+  if(!el){ return; }
+
+  // ── Single scenario mode ────────────────────────────────
+  if(curSingleSc){
+    var sc=curSingleSc, scColor=SC_COLORS[sc]||'var(--teal)';
+    var mbrTotal=0, metCount=0, unmetCount=0;
+    countyRows.forEach(function(r){
+      var metVal=r.met_sc?(r.met_sc[sc]||'N'):(r[sc]>=.90?'Y':'N');
+      if(metVal==='Y'){ metCount++; }
+      else { unmetCount++; mbrTotal+=(r.mbr_na?(r.mbr_na[sc]||0):(r.membersBase||0)); }
+    });
+    var tiles=[
+      {lbl:'Members w/o Access ('+sc+')',   val:mbrTotal.toLocaleString(),   color:scColor,        k:'k-severe',
+       sub:sc+' total members without access across all counties'},
+      {lbl:'Counties Meeting Standard',      val:metCount.toLocaleString(),   color:'var(--green)', k:'k-low',
+       sub:'County+specialty combos where '+sc+' Met Overall = Y'},
+      {lbl:'Counties Not Meeting Standard',  val:unmetCount.toLocaleString(), color:'var(--rose)',  k:'k-high',
+       sub:'County+specialty combos where '+sc+' Met Overall = N'},
+    ];
+    el.style.gridTemplateColumns='repeat(3,1fr)';
+    el.innerHTML=tiles.map(function(t,i){
+      return '<div class="kpi-tile '+t.k+'" style="animation-delay:'+(i*.04)+'s">'
+        +'<div class="kpi-lbl">'+t.lbl+'</div>'
+        +'<div class="kpi-val" style="color:'+t.color+'">'+t.val+'</div>'
+        +'<div class="kpi-sub">'+t.sub+'</div></div>';
+    }).join('');
+    return;
+  }
+
+  // ── Multi-scenario compare mode ─────────────────────────
+  var m=CMP_MODES[curCmpMode];
+  if(!m){ el.innerHTML=''; return; }
+  var baseTotal=0, cmpTotal=0, fillSingle=0, fillIncrease=0;
+  countyRows.forEach(function(r){
+    var na=r.mbr_na||{};
+    baseTotal+=na[m.baseKey]||0;
+    cmpTotal +=na[m.cmpKey] ||0;
+    var bMet=r.met_sc?(r.met_sc[m.baseKey]||'N'):'N';
+    var cMet=r.met_sc?(r.met_sc[m.cmpKey] ||'N'):'N';
+    var fi=fillableInd(r[m.baseKey]||0, r[m.cmpKey]||0, bMet, cMet);
+    if(fi){
+      if(fi.cls==='fill-single')        fillSingle++;
+      else if(fi.cls==='fill-increase') fillIncrease++;
+    }
+  });
+  var gained=baseTotal-cmpTotal;  /* positive = more members now have access in compare scenario */
+  var gainedStr=gained===0?'0':gained>0?'+'+gained.toLocaleString():gained.toLocaleString();
+  var gainedColor=gained>0?'var(--green)':gained<0?'var(--rose)':'var(--text3)';
+  var tiles=[
+    {lbl:'Members w/o Access ('+m.baseKey+')',    val:baseTotal.toLocaleString(),    color:m.baseColor,       k:'k-severe',
+     sub:m.baseKey+' scenario — members still without access'},
+    {lbl:'Members w/o Access ('+m.cmpKey+')',     val:cmpTotal.toLocaleString(),     color:m.cmpColor,        k:'k-high',
+     sub:m.cmpKey+' scenario — members still without access'},
+    {lbl:'Members Gained Access',                 val:gainedStr,                     color:gainedColor,        k:'k-low',
+     sub:'Additional members with access in '+m.cmpKey+' vs '+m.baseKey+' (positive = improvement)'},
+    {lbl:'Fillable by Single Provider',            val:fillSingle.toLocaleString(),   color:'var(--green)',    k:'k-low',
+     sub:'Base <90% → Compare ≥90% with one provider'},
+    {lbl:'Increase in Access by Single Provider',  val:fillIncrease.toLocaleString(),color:'var(--amber)',    k:'k-moderate',
+     sub:'Base <90%, Compare improves but stays <90%'},
+  ];
+  el.style.gridTemplateColumns='repeat(5,1fr)';
+  el.innerHTML=tiles.map(function(t,i){
+    return '<div class="kpi-tile '+t.k+'" style="animation-delay:'+(i*.04)+'s">'
+      +'<div class="kpi-lbl">'+t.lbl+'</div>'
+      +'<div class="kpi-val" style="color:'+t.color+'">'+t.val+'</div>'
+      +'<div class="kpi-sub">'+t.sub+'</div></div>';
+  }).join('');
+}
+
+// Renders a simple single-scenario table (no compare, no delta, no gap result)
+function buildSingleScenarioTable(rows, sc){
+  var scColor=SC_COLORS[sc]||'var(--teal)';
+  var filtered=rows.filter(function(r){
+    var v=r[sc]||0;
+    var metVal=r.met_sc?(r.met_sc[sc]||'N'):(v>=.90?'Y':'N');
+    if(colFilters.county&&!r.county.toLowerCase().includes(colFilters.county.toLowerCase())) return false;
+    if(colFilters.spec&&!r.spec.toLowerCase().includes(colFilters.spec.toLowerCase()))       return false;
+    if(colFilters.expansion!=='all'&&r.expansion!==colFilters.expansion)                     return false;
+    if(colFilters.baseStatus!=='all'&&metVal!==colFilters.baseStatus)                        return false;
+    if(colFilters.fillInd!=='all'){
+      var fv=(r.fill_sc&&r.fill_sc[sc])?r.fill_sc[sc]:'';
+      if(metVal==='Y') fv='';
+      if(colFilters.fillInd==='none'){ if(fv) return false; }
+      else{ if(!fv.toLowerCase().includes(colFilters.fillInd.toLowerCase())) return false; }
+    }
+    return true;
+  });
+  function txtF(val,cb){ return '<input class="col-filter-txt" type="text" placeholder="Filter…" value="'+val+'" oninput="'+cb+'"/>'; }
+  function selF(opts,val,cb){
+    return '<select class="col-filter-sel" onchange="'+cb+'">'
+      +'<option value="all"'+(val==='all'?' selected':'')+'>All</option>'
+      +opts.map(function(o){ return '<option value="'+o+'"'+(val===o?' selected':'')+'>'+o+'</option>'; }).join('')+'</select>';
+  }
+  var thead='<thead><tr>'
+    +'<th>County</th><th>Specialty</th><th style="text-align:center">Expansion</th>'
+    +'<th class="r" style="color:'+scColor+'">'+sc+' % Access</th>'
+    +'<th style="text-align:center" title="Y = Met Overall column value for this scenario">'+sc+' Met (Y)</th>'
+    +'<th class="r">Members w/o Access</th>'
+    +'<th>Fillable Indicator</th>'
+    +'</tr><tr class="filter-row">'
+    +'<th>'+txtF(colFilters.county,"setColFilter('county',this.value)")+'</th>'
+    +'<th>'+txtF(colFilters.spec,"setColFilter('spec',this.value)")+'</th>'
+    +'<th>'+selF(['Y','N'],colFilters.expansion,"setColFilter('expansion',this.value)")+'</th>'
+    +'<th></th>'
+    +'<th>'+selF(['Y','N'],colFilters.baseStatus,"setColFilter('baseStatus',this.value)")+'</th>'
+    +'<th></th>'
+    +'<th>'+selF(['Fillable by Single Provider','Increase in Access by Single Provider','none'],colFilters.fillInd,"setColFilter('fillInd',this.value)")+'</th>'
+    +'</tr></thead>';
+  if(!filtered.length){
+    document.getElementById('county-table').innerHTML=thead
+      +'<tbody><tr><td colspan="7" style="padding:40px;text-align:center;color:var(--text3)">No rows match current filters. '
+      +'<button onclick="resetColFilters();buildSingleScenarioTable(countyRows,\''+sc+'\')" style="color:var(--teal);background:none;border:none;cursor:pointer;font-weight:600;text-decoration:underline">Clear filters</button>'
+      +'</td></tr></tbody>';
+    return;
+  }
+  var tbody=filtered.map(function(r){
+    var v=r[sc]||0;
+    var metVal=r.met_sc?(r.met_sc[sc]||'N'):(v>=.90?'Y':'N');
+    var met=metVal==='Y';
+    var mbr=r.mbr_na?(r.mbr_na[sc]||0):(r.membersBase||0);
+    var fv=(r.fill_sc&&r.fill_sc[sc])?r.fill_sc[sc]:'';
+    if(met) fv='';
+    var fillCell;
+    if(!fv){ fillCell='<span class="fill-none">—</span>'; }
+    else{
+      var sty='font-size:.65rem;font-weight:600;line-height:1.6';
+      fillCell='<span style="'+sty+'"><span style="color:'+scColor+';">('+sc+')</span> '+_esc(fv)+'</span>';
+    }
+    return '<tr>'
+      +'<td style="font-weight:700">'+_esc(r.county)+'</td>'
+      +'<td><span class="county-spec-tag">'+_esc(r.spec)+'</span></td>'
+      +'<td style="text-align:center;font-weight:600">'+r.expansion+'</td>'
+      +'<td class="r" style="color:'+scColor+';font-weight:700">'+(v*100).toFixed(1)+'%</td>'
+      +'<td style="text-align:center"><span class="st-dot '+(met?'st-y':'st-n')+'">'+metVal+'</span></td>'
+      +'<td class="r" style="font-weight:600">'+(met?0:mbr).toLocaleString()+'</td>'
+      +'<td>'+fillCell+'</td>'
+      +'</tr>';
+  }).join('');
+  document.getElementById('county-table').innerHTML=thead+'<tbody>'+tbody+'</tbody>';
+}
+
+function buildCountyTable(rows){
+  var m=CMP_MODES[curCmpMode];
+  if(!m){ document.getElementById('county-table').innerHTML=''; return; }
+  var filtered=applyColFilters(rows);
+  var bLbl=m.baseKey,cLbl=m.cmpKey;
+  var grOpts=['Already Met','Closed','Improved, Still Open','No Change','No Access','Declined'];
+
+  function selF(opts,val,cb){
+    return '<select class="col-filter-sel" onchange="'+cb+'" title="Filter">'
+      +'<option value="all"'+(val==='all'?' selected':'')+'>All</option>'
+      +opts.map(function(o){ return '<option value="'+o+'"'+(val===o?' selected':'')+'>'+o+'</option>'; }).join('')+'</select>';
+  }
+  function txtF(val,cb){ return '<input class="col-filter-txt" type="text" placeholder="Filter…" value="'+val+'" oninput="'+cb+'"/>'; }
+
+  var thead='<thead><tr>'
+    +'<th>County</th><th>Specialty</th><th style="text-align:center">Expansion</th>'
+    +'<th class="r" style="color:'+m.baseColor+'">'+m.baseLabel+'</th>'
+    +'<th class="r" style="color:'+m.cmpColor+'">'+m.cmpLabel+'</th>'
+    +'<th class="r">Delta</th>'
+    +'<th style="text-align:center" title="Y = Met Overall column value for this scenario">'+bLbl+' Met (Y)</th>'
+    +'<th style="text-align:center" title="Y = Met Overall column value for this scenario">'+cLbl+' Met (Y)</th>'
+    +'<th>Gap Result</th><th class="r">Members w/o Access</th><th>Fillable Indicator</th>'
+    +'</tr><tr class="filter-row">'
+    +'<th>'+txtF(colFilters.county,"setColFilter('county',this.value)")+'</th>'
+    +'<th>'+txtF(colFilters.spec,"setColFilter('spec',this.value)")+'</th>'
+    +'<th>'+selF(['Y','N'],colFilters.expansion,"setColFilter('expansion',this.value)")+'</th>'
+    +'<th></th><th></th><th></th>'
+    +'<th>'+selF(['Y','N'],colFilters.baseStatus,"setColFilter('baseStatus',this.value)")+'</th>'
+    +'<th>'+selF(['Y','N'],colFilters.cmpStatus,"setColFilter('cmpStatus',this.value)")+'</th>'
+    +'<th>'+selF(grOpts,colFilters.gapResult,"setColFilter('gapResult',this.value)")+'</th>'
+    +'<th></th>'
+    +'<th>'+selF(['Fillable by Single Provider','Increase in Access by Single Provider','none'],colFilters.fillInd,"setColFilter('fillInd',this.value)")+'</th>'
+    +'</tr></thead>';
+
+  if(!filtered.length){
+    document.getElementById('county-table').innerHTML=thead
+      +'<tbody><tr><td colspan="11" style="padding:40px;text-align:center;color:var(--text3)">No rows match current filters. '
+      +'<button onclick="resetColFilters();buildCountyTable(countyRows)" style="color:var(--teal);background:none;border:none;cursor:pointer;font-weight:600;text-decoration:underline">Clear filters</button>'
+      +'</td></tr></tbody>';
+    return;
+  }
+
+  var tbody=filtered.map(function(r){
+    var base=r[m.baseKey]||0,cmp=r[m.cmpKey]||0,delta=cmp-base;
+    // Read actual Met Overall value per scenario; fall back to 90% threshold if not stored
+    var bMet=r.met_sc?(r.met_sc[m.baseKey]||'N'):(base>=.90?'Y':'N');
+    var cMet=r.met_sc?(r.met_sc[m.cmpKey] ||'N'):(cmp >=.90?'Y':'N');
+    var baseMet=bMet==='Y', cmpMet=cMet==='Y';
+    var dStr=delta>0?'<span class="delta-pos">+'+(delta*100).toFixed(1)+'</span>'
+            :delta<0?'<span class="delta-neg">'+(delta*100).toFixed(1)+'</span>'
+            :'<span class="delta-zero">0.0</span>';
+    var gr=gapResult(base,cmp,bMet,cMet);
+    return '<tr>'
+      +'<td style="font-weight:700">'+_esc(r.county)+'</td>'
+      +'<td><span class="county-spec-tag">'+_esc(r.spec)+'</span></td>'
+      +'<td style="text-align:center;font-weight:600">'+r.expansion+'</td>'
+      +'<td class="r" style="color:'+m.baseColor+';font-weight:700">'+(base*100).toFixed(1)+'%</td>'
+      +'<td class="r" style="color:'+m.cmpColor+';font-weight:700">'+(cmp*100).toFixed(1)+'%</td>'
+      +'<td class="r">'+dStr+'</td>'
+      +'<td style="text-align:center"><span class="st-dot '+(baseMet?'st-y':'st-n')+'">'+bMet+'</span></td>'
+      +'<td style="text-align:center"><span class="st-dot '+(cmpMet?'st-y':'st-n')+'">'+cMet+'</span></td>'
+      +'<td><span class="'+gr.cls+'">'+gr.label+'</span></td>'
+      +'<td class="r" style="font-weight:600">'+(baseMet?0:(r.mbr_na?(r.mbr_na[m.baseKey]||0):(r.membersBase||0))).toLocaleString()+'</td>'
+      +'<td>'+buildFillableDisplay(r,m)+'</td>'
+      +'</tr>';
+  }).join('');
+
+  document.getElementById('county-table').innerHTML=thead+'<tbody>'+tbody+'</tbody>';
+}
+
+// Column header filter inputs and search box wired to these helpers
+function setColFilter(key,val){
+  colFilters[key]=val;
+  if(curSingleSc) buildSingleScenarioTable(countyRows,curSingleSc);
+  else buildCountyTable(countyRows);
+}
+function filterCountyTable(){
+  colFilters.county=document.getElementById('county-search-input').value;
+  if(curSingleSc) buildSingleScenarioTable(countyRows,curSingleSc);
+  else buildCountyTable(countyRows);
+}
+
+/* ══════════════════════════════════════════════════════════
+   ROUTING
+   pg1 = Overview, pg2 = Drill-down.
+   The Detail nav button is hidden on pg1 and shown on pg2.
+   ══════════════════════════════════════════════════════════ */
+function switchPage(id){
+  document.querySelectorAll('.pg').forEach(function(p){ p.classList.remove('on'); });
+  document.getElementById(id).classList.add('on');
+  var onDrill=id==='pg2';
+  document.getElementById('nb-ov').classList.toggle('on',!onDrill);
+  document.getElementById('nb-dr').classList.toggle('on',onDrill);
+  document.getElementById('nb-dr').style.display=onDrill?'flex':'none';
+  window.scrollTo(0,0);
+}
+function goHome(){ switchPage('pg1'); }
+
+// Switch between Specialty and County sub-tabs; lazy-loads county table on first open
+function switchSubTab(tab){
+  curSubTab=tab;
+  ['spec','county'].forEach(function(t){
+    document.getElementById('st-'+t).classList.toggle('on',t===tab);
+    document.getElementById('sp-'+t).classList.toggle('on',t===tab);
+  });
+  if(tab==='county') renderCountyTable();
+  window.scrollTo(0,0);
+}
+
+/* ══════════════════════════════════════════════════════════
+   INIT — runs once on page load
+   ══════════════════════════════════════════════════════════ */
+curState = STATES[0] || '';
+
+// The expansion toggle is hidden in HTML by default; only shown when data has an Expansion column
+if(HAS_EXPANSION){
+  document.getElementById('exp-toggle-wrap').style.display = 'flex';
+}
+
+renderStateFilter();
+renderOvLegend();
+renderProdGrid();
+</script>
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------------------
+# HTML generation
+# ---------------------------------------------------------------------------
+
+def generate_html(data):
+    blob     = json.dumps(data, separators=(',', ':'), ensure_ascii=False)
+    gen_date = date.today().strftime('%m/%d/%Y')
+    return (HTML_TEMPLATE
+            .replace('/*__DATA__*/', 'const DATA = ' + blob + ';')
+            .replace('/*__GEN_DATE__*/', gen_date))
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        here = Path(__file__).parent
+        input_path = here / 'dashboard_dataset.xlsx'
+        if not input_path.exists():
+            print("ERROR: Excel file not found in the folder.")
+            print("Expected file: dashboard_dataset.xlsx")
+            sys.exit(1)
+        print(f"Auto-detected: {input_path}")
+    else:
+        input_path = Path(args[0])
+
+    output_path = Path(args[1]) if len(args) >= 2 else input_path.with_name(input_path.stem + '_dashboard.html')
+
+    if not input_path.exists():
+        print(f"File not found: {input_path}")
+        sys.exit(1)
+
+    data = process_excel(input_path)
+    html = generate_html(data)
+    output_path.write_text(html, encoding='utf-8')
+    print(f"\nDone → {output_path}  ({len(html)//1024} KB)")
+
+
+if __name__ == '__main__':
+    main()
